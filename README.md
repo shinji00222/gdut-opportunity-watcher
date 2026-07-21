@@ -1,0 +1,58 @@
+# 广工机会提醒
+
+一个面向广东工业大学学生的 Windows 信息提醒工具。它每天定时检查学校公开网站，收集竞赛、实习和出国项目，完成后自动退出，不常驻后台。
+
+## 功能
+
+- 竞赛、实习、出国三类信息
+- Windows 定时检查与新消息通知
+- 原通知链接、简介和硬性条件采集
+- 本地个人档案与匹配度排序
+- 已达成/未达成条件提示
+- 项目收藏与分类筛选
+- 多个信息源并行检查
+
+## 隐私
+
+个人档案、收藏、检测历史和日志只保存在用户电脑的：
+
+```text
+%LOCALAPPDATA%\GDUTCompetitionWatcher
+```
+
+这些数据不会写入仓库，也不会上传到 GitHub。
+
+## 从源码运行
+
+需要 Python 3.12 或更高版本：
+
+```powershell
+python -m pip install -r requirements.txt
+python src\gdut_competition_watcher.py
+```
+
+执行一次静默检查并退出：
+
+```powershell
+python src\gdut_competition_watcher.py --scheduled
+```
+
+## 构建 Windows 程序
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm --clean --onefile --windowed `
+  --name GDUTCompetitionWatcher --collect-all winotify `
+  src\gdut_competition_watcher.py
+```
+
+生成文件位于 `dist\GDUTCompetitionWatcher.exe`。
+
+## 数据准确性
+
+工具只读取学校公开网页。网站改版、网络故障，以及只存在于附件、图片、微信群或公众号中的要求，都可能影响识别结果。报名和申请前请以学校原通知为准。
+
+## 开源许可
+
+MIT License
+
