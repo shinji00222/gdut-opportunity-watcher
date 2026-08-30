@@ -491,7 +491,12 @@ class MainWindow:
         self.summary = tk.Text(summary_box, height=6, wrap="word", relief="flat", background="#f4f4f4")
         self.summary.pack(fill="x")
         self.summary.insert("1.0", "选择一条竞赛消息，这里会显示简略介绍。")
+        self.summary.tag_configure("link", foreground="#0563c1", underline=True)
+        self.summary.tag_bind("link", "<Button-1>", self.open_summary_link)
+        self.summary.tag_bind("link", "<Enter>", lambda _event: self.summary.config(cursor="hand2"))
+        self.summary.tag_bind("link", "<Leave>", lambda _event: self.summary.config(cursor=""))
         self.summary.config(state="disabled")
+        self.summary_link_url = ""
 
         bottom = ttk.Frame(self.root, padding=12)
         bottom.pack(fill="x")
@@ -531,6 +536,10 @@ class MainWindow:
             if n["id"] == nid:
                 webbrowser.open(n["url"])
                 break
+
+    def open_summary_link(self, _event=None):
+        if self.summary_link_url:
+            webbrowser.open(self.summary_link_url)
 
     def handle_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -636,8 +645,14 @@ class MainWindow:
                 break
         self.summary.config(state="normal")
         self.summary.delete("1.0", "end")
+        self.summary_link_url = ""
         self.summary.insert("end", text + "\n\n")
         if selected_notice:
+            url = selected_notice.get("url", "")
+            if url:
+                self.summary.insert("end", "原通知链接：")
+                self.summary.insert("end", url + "\n\n", "link")
+                self.summary_link_url = url
             state = load_state()
             score, conditions, hard_fail = evaluate_notice(selected_notice, state.get("profile", {}))
             self.summary.insert("end", f"匹配度：{score}%" + ("（存在硬性条件不符）" if hard_fail else "") + "\n")
