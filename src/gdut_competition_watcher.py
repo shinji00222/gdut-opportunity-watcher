@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 import tkinter as tk
@@ -47,6 +47,7 @@ CATEGORY_KEYWORDS = {
 }
 KEYWORDS = tuple(dict.fromkeys(k for values in CATEGORY_KEYWORDS.values() for k in values))
 IGNORE_WORDS = ("教师教学创新大赛", "教职工", "体育比赛成绩")
+DEADLINE_KEYWORDS = ("报名", "申报", "申请", "提交", "截止", "截至")
 
 
 @dataclass
@@ -148,6 +149,81 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_date(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _deadline_context_is_relevant(text: str, start: int, end: int) -> bool:
+    context = text[max(0, start - 24):min(len(text), end + 24)]
+    return any(keyword in context for keyword in DEADLINE_KEYWORDS)
+
+
+def extract_registration_deadline(notice: dict, today: date | None = None) -> date | None:
+    """Extract the latest explicit registration/application deadline from notice text."""
+    today = today or date.today()
+    text = " ".join(
+        str(notice.get(key, "") or "")
+        for key in ("title", "summary", "detail_text")
+    )
+    if not text:
+        return None
+
+    deadlines: list[date] = []
+    range_same_month_pattern = re.compile(
+        r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?\s*"
+        r"(?:至|到|[-~～—])\s*(?!20\d{2})(\d{1,2})\s*(?:日|号)?"
+    )
+    full_date_pattern = re.compile(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*[月\-/\.]\s*(\d{1,2})\s*(?:日|号)?")
+    month_day_pattern = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?")
+
+    for match in range_same_month_pattern.finditer(text):
+        if not _deadline_context_is_relevant(text, match.start(), match.end()):
+            continue
+        parsed = _safe_date(int(match.group(1) or today.year), int(match.group(2)), int(match.group(4)))
+        if parsed:
+            deadlines.append(parsed)
+
+    for match in full_date_pattern.finditer(text):
+        if not _deadline_context_is_relevant(text, match.start(), match.end()):
+            continue
+        parsed = _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        if parsed:
+            deadlines.append(parsed)
+
+    occupied_ranges = [match.span() for match in full_date_pattern.finditer(text)]
+    for match in month_day_pattern.finditer(text):
+        if any(start <= match.start() < end for start, end in occupied_ranges):
+            continue
+        if not _deadline_context_is_relevant(text, match.start(), match.end()):
+            continue
+        parsed = _safe_date(today.year, int(match.group(1)), int(match.group(2)))
+        if parsed:
+            deadlines.append(parsed)
+
+    return max(deadlines) if deadlines else None
+
+
+def notice_is_registration_expired(notice: dict, today: date | None = None) -> bool:
+    today = today or date.today()
+    deadline = extract_registration_deadline(notice, today)
+    return bool(deadline and deadline < today)
+
+
+def prune_expired_notices(state: dict, today: date | None = None) -> list[str]:
+    today = today or date.today()
+    notices = state.get("notices", [])
+    kept = [notice for notice in notices if not notice_is_registration_expired(notice, today)]
+    removed_ids = {notice.get("id") for notice in notices} - {notice.get("id") for notice in kept}
+    if removed_ids:
+        state["notices"] = kept
+        state["favorites"] = [item for item in state.get("favorites", []) if item not in removed_ids]
+        state["expired_removed"] = sorted(removed_ids)
+    return sorted(item for item in removed_ids if item)
 
 
 def fetch(url: str) -> str:
@@ -274,7 +350,6 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
     current, errors = check_all()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     seen = set(state.get("seen", []))
-    new_items = [n for n in current if n.id not in seen]
     first_run = not state.get("initialized", False) or state.get("schema_version", 1) < 2
     old_by_id = {n["id"]: n for n in state.get("notices", [])}
     for n in current:
@@ -297,6 +372,8 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
     if detail_targets:
         with ThreadPoolExecutor(max_workers=min(6, len(detail_targets))) as pool:
             list(pool.map(load_detail, detail_targets))
+    current = [n for n in current if not notice_is_registration_expired(asdict(n))]
+    new_items = [n for n in current if n.id not in seen]
     for n in current:
         old_by_id[n.id] = asdict(n)
     merged = list(old_by_id.values())[-500:]
@@ -308,6 +385,7 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
         "last_error": "；".join(errors),
         "schema_version": 2,
     })
+    removed_expired = prune_expired_notices(state)
     save_state(state)
     if notify and new_items and not first_run:
         preview = "；".join(n.title[:35] for n in new_items[:3])
@@ -318,7 +396,7 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
             counts[item.category] = counts.get(item.category, 0) + 1
         category_text = "、".join(f"{k}{v}条" for k, v in counts.items())
         notify_windows(f"发现 {len(new_items)} 条新消息（{category_text}）", preview)
-    log(f"检查完成，发现 {len(current)} 条，新增 {0 if first_run else len(new_items)} 条，错误 {len(errors)} 个")
+    log(f"检查完成，发现 {len(current)} 条，新增 {0 if first_run else len(new_items)} 条，清理过期 {len(removed_expired)} 条，错误 {len(errors)} 个")
     return ([] if first_run else new_items), errors, first_run
 
 
