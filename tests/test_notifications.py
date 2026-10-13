@@ -338,12 +338,16 @@ class SourceHealthTests(unittest.TestCase):
         with (
             patch.object(watcher, "SOURCES", [("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛")]),
             patch.object(watcher, "fetch", side_effect=[first_page, OSError("offline")]),
+            patch.object(watcher, "log") as mock_log,
         ):
             notices, errors = watcher.check_all()
 
         self.assertEqual([notice.title for notice in notices], ["校级人工智能竞赛"])
         self.assertEqual(len(errors), 1)
         self.assertIn("分页读取失败", errors[0])
+        mock_log.assert_called_once_with(
+            "ERROR 学生就业指导中心赛事: 分页读取失败：offline"
+        )
 
 
 if __name__ == "__main__":
