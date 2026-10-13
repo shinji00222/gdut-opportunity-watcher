@@ -29,6 +29,7 @@ MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
 DETAIL_REFRESH_INTERVAL = timedelta(days=7)
 DETAIL_RETRY_INTERVAL = timedelta(days=1)
+MAX_DETAIL_TARGETS = 30
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -612,6 +613,22 @@ def detail_refresh_due(
     return now - checked_at >= DETAIL_REFRESH_INTERVAL
 
 
+def select_detail_targets(notices: list[Notice]) -> list[Notice]:
+    eligible = [
+        n for n in notices
+        if n.source != "蓝桥杯大赛官网"
+        and (
+            ((not n.detail_text or not n.hard_conditions) and detail_refresh_due("", n.detail_attempted_at))
+            or detail_refresh_due(n.detail_checked_at, n.detail_attempted_at)
+        )
+    ]
+    # 未尝试过的通知先处理，避免重复失败的旧详情长期占满每批的前 30 个位置。
+    eligible.sort(key=lambda n: (
+        bool(n.detail_attempted_at), n.detail_attempted_at, n.first_seen, n.id
+    ))
+    return eligible[:MAX_DETAIL_TARGETS]
+
+
 def recently_expired_notice_ids(state: dict, notices: list[Notice], today: date | None = None) -> set[str]:
     today = today or date.today()
     cache = state.get("expired_checked_at", {})
@@ -909,14 +926,7 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
             n.detail_checked_at = old.get("detail_checked_at") or old.get("first_seen", "")
             n.detail_attempted_at = old.get("detail_attempted_at", "")
     # 先刷新详情已过期的项目，再按截止日清理，避免延期后仍按旧日期删除。
-    detail_targets = [
-        n for n in current
-        if n.source != "蓝桥杯大赛官网"
-        and (
-            ((not n.detail_text or not n.hard_conditions) and detail_refresh_due("", n.detail_attempted_at))
-            or detail_refresh_due(n.detail_checked_at, n.detail_attempted_at)
-        )
-    ][:30]
+    detail_targets = select_detail_targets(current)
     def load_detail(n: Notice):
         try:
             summary, detail_text, hard_conditions = extract_detail_data(fetch(n.url), n.title)

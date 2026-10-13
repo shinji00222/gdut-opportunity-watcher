@@ -64,6 +64,28 @@ class LanqiaoRegistrationNotificationTests(unittest.TestCase):
 
 
 class CheckCoordinationTests(unittest.TestCase):
+    def test_never_attempted_details_are_prioritized_over_old_retries(self):
+        old_attempt = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        repeatedly_failed = [
+            watcher.Notice(
+                id=f"failed-{index}", title=f"旧通知 {index}", url=f"https://example.com/old/{index}",
+                source="测试来源", detail_attempted_at=old_attempt,
+            )
+            for index in range(watcher.MAX_DETAIL_TARGETS)
+        ]
+        never_attempted = [
+            watcher.Notice(
+                id=f"new-{index}", title=f"新通知 {index}", url=f"https://example.com/new/{index}",
+                source="测试来源",
+            )
+            for index in range(12)
+        ]
+
+        selected = watcher.select_detail_targets(repeatedly_failed + never_attempted)
+
+        self.assertEqual(len(selected), watcher.MAX_DETAIL_TARGETS)
+        self.assertEqual({notice.id for notice in selected[:12]}, {notice.id for notice in never_attempted})
+
     def test_seen_notice_deadline_change_is_refreshed_and_notified_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
