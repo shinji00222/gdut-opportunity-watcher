@@ -33,6 +33,8 @@ DETAIL_RETRY_INTERVAL = timedelta(days=1)
 MAX_DETAIL_TARGETS = 30
 INTERNATIONAL_INTERNSHIP_SOURCE = "国际组织实习平台"
 INTERNATIONAL_INTERNSHIP_URL = "https://gj.ncss.cn/job.html"
+NATIONAL_INTERNSHIP_SOURCE = "国家大学生就业服务平台实习岗位"
+NATIONAL_INTERNSHIP_URL = "https://job.ncss.cn/student/jobs/internindex.html"
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -47,7 +49,7 @@ SOURCES = [
     ("工程训练中心学科竞赛", "https://etc.gdut.edu.cn/index/xkjs.htm", "竞赛"),
     ("蓝桥杯大赛官网", "https://dasai.lanqiao.cn/pages/v7/dasai/competition/individual_competition.html", "竞赛"),
     ("国际合作与交流处", "https://wsc.gdut.edu.cn/", "出国"),
-    ("就业信息网", "https://career.gdut.edu.cn/campus/index", "实习"),
+    (NATIONAL_INTERNSHIP_SOURCE, NATIONAL_INTERNSHIP_URL, "实习"),
     (INTERNATIONAL_INTERNSHIP_SOURCE, INTERNATIONAL_INTERNSHIP_URL, "实习"),
 ]
 
@@ -370,6 +372,99 @@ def fetch_international_internship_notices() -> list[Notice]:
     if not notices_by_id:
         raise ValueError("国际组织实习平台未返回可解析岗位，可能接口或筛选结构已变化")
     return list(notices_by_id.values())
+
+
+def fetch_national_internship_notices() -> list[Notice]:
+    """Read a bounded set of active Guangdong internships from the official NCSS feed."""
+    endpoint = "https://job.ncss.cn/student/jobs/jobslist/ajax/"
+    notices_by_id: dict[str, Notice] = {}
+    for page in (1, 2):
+        params = urllib.parse.urlencode({
+            "jobType": "03",
+            "areaCode": "44",
+            "jobName": "",
+            "monthPay": "",
+            "industrySectors": "",
+            "property": "",
+            "categoryCode": "",
+            "memberLevel": "",
+            "offset": str(page),
+            "limit": "9",
+            "keyUnits": "",
+            "degreeCode": "",
+            "sourcesName": "0",
+            "sourcesType": "",
+        })
+        request_url = f"{endpoint}?{params}"
+        request = urllib.request.Request(request_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GDUT-Competition-Watcher/1.0",
+            "Referer": NATIONAL_INTERNSHIP_URL,
+        })
+        payload = fetch(request.full_url)
+        try:
+            response = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("国家大学生就业服务平台实习接口返回了无效 JSON") from exc
+        data = response.get("data") if isinstance(response, dict) else None
+        rows = data.get("list") if isinstance(data, dict) else None
+        if not isinstance(response, dict) or response.get("flag") is not True or not isinstance(rows, list):
+            raise ValueError("国家大学生就业服务平台实习接口格式异常")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            job_id = str(row.get("jobId", "")).strip()
+            title = " ".join(html_lib.unescape(str(row.get("jobName", ""))).split())
+            if not job_id or not title:
+                continue
+            job_url = f"https://job.ncss.cn/student/jobs/{urllib.parse.quote(job_id, safe='')}/detail.html"
+            company = " ".join(html_lib.unescape(str(row.get("recName", ""))).split())
+            city = " ".join(html_lib.unescape(str(row.get("areaCodeName", ""))).split())
+            salary_low, salary_high = row.get("lowMonthPay"), row.get("highMonthPay")
+            salary = ""
+            if isinstance(salary_low, (int, float)) and isinstance(salary_high, (int, float)):
+                salary = "面议" if salary_low == salary_high == 0 else f"{salary_low:g}-{salary_high:g}K/月"
+            education = " ".join(html_lib.unescape(str(row.get("degreeName", ""))).split())
+            major = " ".join(html_lib.unescape(str(row.get("major", ""))).split())
+            published = _international_platform_date(row.get("publishDate"))
+            details = [part for part in (company, city, salary, education, f"专业：{major}" if major else "") if part]
+            if published:
+                details.append(f"发布日期：{published}")
+            notice_id = hashlib.sha256(job_url.encode("utf-8")).hexdigest()[:20]
+            notices_by_id[notice_id] = Notice(
+                id=notice_id,
+                title=title,
+                url=job_url,
+                source=NATIONAL_INTERNSHIP_SOURCE,
+                date=published,
+                summary="；".join(details),
+                category="实习",
+            )
+    if not notices_by_id:
+        raise ValueError("国家大学生就业服务平台未返回可解析的广东实习岗位")
+    return list(notices_by_id.values())
+
+
+def extract_national_job_detail_data(html: str, title: str) -> tuple[str, str, list[str]]:
+    match = re.search(
+        r'<pre\b[^>]*class=["\'][^"\']*\bmainContent\b[^"\']*["\'][^>]*>(.*?)</pre>',
+        html,
+        re.I | re.S,
+    )
+    if not match:
+        raise ValueError("国家大学生就业服务平台职位详情中未找到岗位正文")
+    body = re.sub(r"<br\s*/?>", "\n", match.group(1), flags=re.I)
+    body = html_lib.unescape(re.sub(r"<[^>]+>", " ", body))
+    lines = [re.sub(r"\s+", " ", line).strip() for line in body.splitlines()]
+    lines = [line for line in lines if line]
+    detail_text = "\n".join(lines)[:12000]
+    if len(detail_text) < 20:
+        raise ValueError("国家大学生就业服务平台职位正文为空")
+    summary = " ".join(lines[:2])[:220]
+    markers = ("要求", "须", "必须", "本科", "硕士", "博士", "专业", "出勤", "实习", "经验", "语言")
+    conditions = [line for line in lines if any(marker in line for marker in markers)]
+    if not conditions:
+        conditions = ["岗位正文未明确提取到硬性条件，请打开原职位查看详情。"]
+    return summary, detail_text, conditions[:20]
 
 
 def log(text: str) -> None:
@@ -925,6 +1020,8 @@ def check_all() -> tuple[list[Notice], list[str]]:
         try:
             if source == INTERNATIONAL_INTERNSHIP_SOURCE:
                 return source, fetch_international_internship_notices(), ""
+            if source == NATIONAL_INTERNSHIP_SOURCE:
+                return source, fetch_national_internship_notices(), ""
             html = fetch(url)
             if source == "学生就业指导中心赛事":
                 items = extract_career_competition_notices(html, url)
@@ -1024,7 +1121,11 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
     detail_targets = select_detail_targets(current)
     def load_detail(n: Notice):
         try:
-            summary, detail_text, hard_conditions = extract_detail_data(fetch(n.url), n.title)
+            detail_html = fetch(n.url)
+            if n.source == NATIONAL_INTERNSHIP_SOURCE:
+                summary, detail_text, hard_conditions = extract_national_job_detail_data(detail_html, n.title)
+            else:
+                summary, detail_text, hard_conditions = extract_detail_data(detail_html, n.title)
             if not detail_text:
                 raise ValueError("通知正文没有可提取的有效内容")
             n.summary = summary
