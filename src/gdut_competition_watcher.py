@@ -378,7 +378,7 @@ def fetch_national_internship_notices() -> list[Notice]:
     """Read a bounded set of active Guangdong internships from the official NCSS feed."""
     endpoint = "https://job.ncss.cn/student/jobs/jobslist/ajax/"
     notices_by_id: dict[str, Notice] = {}
-    for page in (1, 2):
+    for page in (1, 2, 3):
         params = urllib.parse.urlencode({
             "jobType": "03",
             "areaCode": "44",
@@ -389,7 +389,7 @@ def fetch_national_internship_notices() -> list[Notice]:
             "categoryCode": "",
             "memberLevel": "",
             "offset": str(page),
-            "limit": "9",
+            "limit": "20",
             "keyUnits": "",
             "degreeCode": "",
             "sourcesName": "0",
