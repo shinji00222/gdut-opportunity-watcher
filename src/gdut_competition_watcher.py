@@ -753,6 +753,13 @@ def extract_notices(
 
 
 def extract_detail_data(html: str, title: str) -> tuple[str, str, list[str]]:
+    if re.search(
+        r'<div\b[^>]*class=["\'][^"\']*\baContent\b[^"\']*["\'][^>]*>'
+        r'\s*<section\b[^>]*id=["\']content\d+["\'][^>]*>\s*</section>',
+        html,
+        re.I,
+    ):
+        return "学校原通知详情由动态区域加载，当前未能读取正文。", "", []
     parser = ParagraphParser()
     parser.feed(html)
     candidates = []
@@ -912,7 +919,12 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
     ][:30]
     def load_detail(n: Notice):
         try:
-            n.summary, n.detail_text, n.hard_conditions = extract_detail_data(fetch(n.url), n.title)
+            summary, detail_text, hard_conditions = extract_detail_data(fetch(n.url), n.title)
+            if not detail_text:
+                raise ValueError("通知正文没有可提取的有效内容")
+            n.summary = summary
+            n.detail_text = detail_text
+            n.hard_conditions = hard_conditions
             n.detail_checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         except Exception as exc:
             n.summary = n.summary or "详情暂时无法读取，请打开学校原通知查看。"

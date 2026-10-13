@@ -172,6 +172,63 @@ class CheckCoordinationTests(unittest.TestCase):
                 watcher.run_check(notify=False)
                 fetch.assert_called_once()
 
+    def test_dynamic_detail_placeholder_is_not_saved_as_valid_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            notice_id = "dynamic-detail-placeholder"
+            checked_at = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            old_notice = watcher.Notice(
+                id=notice_id,
+                title="暑期实习报名通知",
+                url="https://career.gdut.edu.cn/campus/view/id/123",
+                source="测试来源",
+                category="实习",
+                summary="已保存的有效摘要，实习报名面向在校本科生。",
+                detail_text="已保存的有效正文，报名要求以官方通知为准。",
+                hard_conditions=["在校本科生可报名。"],
+                detail_checked_at=checked_at,
+            )
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [notice_id],
+                "notices": [asdict(old_notice)],
+                "favorites": [],
+                "profile": {},
+            }), encoding="utf-8")
+            current_notice = watcher.Notice(
+                id=notice_id,
+                title=old_notice.title,
+                url=old_notice.url,
+                source=old_notice.source,
+                category=old_notice.category,
+            )
+            page = """
+            <div class="aContent"><section id="content1234" style="background-image:url(/loading.gif);"></section></div>
+            <p>大学城校区：020-39322471（学生就业事务咨询）</p>
+            <p>招聘邮箱：job@example.com</p>
+            """
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", return_value=([current_notice], [])),
+                patch.object(watcher, "fetch", return_value=page) as fetch,
+            ):
+                watcher.run_check(notify=False)
+                saved = watcher.load_state()["notices"][0]
+                self.assertEqual(saved["summary"], old_notice.summary)
+                self.assertEqual(saved["detail_text"], old_notice.detail_text)
+                self.assertEqual(saved["hard_conditions"], old_notice.hard_conditions)
+                self.assertEqual(saved["detail_checked_at"], checked_at)
+                self.assertTrue(saved["detail_attempted_at"])
+                fetch.assert_called_once()
+
+                watcher.run_check(notify=False)
+                fetch.assert_called_once()
+
     def test_expired_notice_is_refreshed_weekly_without_daily_repeat_fetches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
