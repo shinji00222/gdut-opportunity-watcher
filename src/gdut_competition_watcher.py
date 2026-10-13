@@ -35,6 +35,8 @@ INTERNATIONAL_INTERNSHIP_SOURCE = "国际组织实习平台"
 INTERNATIONAL_INTERNSHIP_URL = "https://gj.ncss.cn/job.html"
 NATIONAL_INTERNSHIP_SOURCE = "国家大学生就业服务平台实习岗位"
 NATIONAL_INTERNSHIP_URL = "https://job.ncss.cn/student/jobs/internindex.html"
+GDUT_COLLECTION_SOURCE = "广工双创平台竞赛征集"
+GDUT_COLLECTION_URL = "https://icxcy.gdut.edu.cn/"
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -45,6 +47,7 @@ SOURCES = [
     ("学生工作处", "https://xsc.gdut.edu.cn/xwzx/tzgg.htm", None),
     ("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛"),
     ("创新创业学院", "https://cxcy.gdut.edu.cn/", "竞赛"),
+    (GDUT_COLLECTION_SOURCE, GDUT_COLLECTION_URL, "竞赛"),
     ("广东省工科大学生实验综合技能竞赛", "https://jnds.gdut.edu.cn/", "竞赛"),
     ("工程训练中心学科竞赛", "https://etc.gdut.edu.cn/index/xkjs.htm", "竞赛"),
     ("蓝桥杯大赛官网", "https://dasai.lanqiao.cn/pages/v7/dasai/competition/individual_competition.html", "竞赛"),
@@ -977,6 +980,114 @@ def extract_notices(
     return list(found.values())
 
 
+def fetch_gdut_collection_notices(today: date | None = None) -> list[Notice]:
+    """Read active competition submissions from GDUT's public innovation platform."""
+    today = today or date.today()
+    endpoint = urllib.parse.urljoin(GDUT_COLLECTION_URL, "/api/admin/project/project_collection/page")
+    page_size = 50
+    max_pages = 2
+    total_pages = 1
+    notices_by_id: dict[str, Notice] = {}
+    page_errors: list[str] = []
+
+    for page in range(1, max_pages + 1):
+        if page > total_pages:
+            break
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"page": page, "size": page_size, "status": 1}).encode("utf-8"),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GDUT-Competition-Watcher/1.0",
+                "Content-Type": "application/json",
+                "Referer": GDUT_COLLECTION_URL,
+                "tCode": "gdut",
+                "language": "zh-cn",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read(MAX_PAGE_BYTES + 1)
+            if len(raw) > MAX_PAGE_BYTES:
+                raise ValueError(f"接口响应超过 {MAX_PAGE_BYTES // (1024 * 1024)} MB")
+            payload = json.loads(raw.decode("utf-8"))
+            data = payload.get("data") if isinstance(payload, dict) else None
+            rows = data.get("list") if isinstance(data, dict) else None
+            if not isinstance(payload, dict) or payload.get("code") != 0 or not isinstance(rows, list):
+                raise ValueError("接口格式异常：征集列表缺失")
+            if page == 1:
+                pagination = data.get("pagination")
+                total = pagination.get("total") if isinstance(pagination, dict) else len(rows)
+                try:
+                    total_pages = min(max_pages, max(1, (int(total) + page_size - 1) // page_size))
+                except (TypeError, ValueError):
+                    total_pages = 1
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = " ".join(html_lib.unescape(str(row.get("name", ""))).split())
+                if not title or classify(title, None) != "竞赛":
+                    continue
+                if row.get("isOngoing") not in (1, True, "1", "true"):
+                    continue
+                raw_deadline = str(row.get("ddlTime", "")).strip()
+                deadline = None
+                if raw_deadline:
+                    try:
+                        deadline = datetime.strptime(raw_deadline[:19], "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        page_errors.append(f"第 {page} 页有征集条目的截止时间格式无法识别")
+                        continue
+                    if deadline.date() < today:
+                        continue
+
+                collection_id = str(row.get("id", "")).strip()
+                if not collection_id:
+                    continue
+                source_url = urllib.parse.urljoin(
+                    GDUT_COLLECTION_URL,
+                    f"/collectionDetail?id={urllib.parse.quote(collection_id, safe='')}",
+                )
+                notice_id = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:20]
+                create_time = str(row.get("createTime", "")).strip()
+                created_date = create_time[:10] if re.match(r"20\d{2}-\d{2}-\d{2}", create_time) else ""
+                deadline_label = (
+                    f"{deadline.year}年{deadline.month}月{deadline.day}日 {deadline:%H:%M}"
+                    if deadline else "以原征集页面为准"
+                )
+                content_parser = VisibleTextParser()
+                content_parser.feed(str(row.get("content", "") or ""))
+                detail_text = " ".join(content_parser.parts).strip()
+                if not detail_text:
+                    detail_text = "请打开广工创新创业平台原征集页面核对通知及附件。"
+                summary = f"平台显示正在征集，截止时间：{deadline_label}。"
+                if detail_text:
+                    summary += " " + detail_text[:180]
+                now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                notices_by_id[notice_id] = Notice(
+                    id=notice_id,
+                    title=title,
+                    url=source_url,
+                    source=GDUT_COLLECTION_SOURCE,
+                    date=created_date,
+                    summary=summary[:260],
+                    category="竞赛",
+                    detail_text=detail_text[:12000],
+                    hard_conditions=["参赛对象、作品要求及提交方式请以广工创新创业平台原征集页面和附件为准。"],
+                    lifecycle_stage="open",
+                    detail_checked_at=now_text,
+                )
+        except Exception as exc:
+            page_errors.append(f"第 {page} 页读取失败：{exc}")
+
+    if not notices_by_id and page_errors:
+        raise ValueError("广工双创平台竞赛征集读取失败；" + "；".join(page_errors))
+    if page_errors:
+        raise PartialSourceError(list(notices_by_id.values()), "；".join(page_errors))
+    return list(notices_by_id.values())
+
+
 def extract_detail_data(html: str, title: str) -> tuple[str, str, list[str]]:
     if re.search(
         r'<div\b[^>]*class=["\'][^"\']*\baContent\b[^"\']*["\'][^>]*>'
@@ -1046,6 +1157,11 @@ def check_all() -> tuple[list[Notice], list[str]]:
     def load_source(item):
         source, url, source_default = item
         try:
+            if source == GDUT_COLLECTION_SOURCE:
+                try:
+                    return source, fetch_gdut_collection_notices(), ""
+                except PartialSourceError as exc:
+                    return source, exc.notices, str(exc)
             if source == INTERNATIONAL_INTERNSHIP_SOURCE:
                 try:
                     return source, fetch_international_internship_notices(), ""
