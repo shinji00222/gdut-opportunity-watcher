@@ -38,6 +38,7 @@ SOURCES = [
     ("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛"),
     ("创新创业学院", "https://cxcy.gdut.edu.cn/", "竞赛"),
     ("广东省工科大学生实验综合技能竞赛", "https://jnds.gdut.edu.cn/", "竞赛"),
+    ("工程训练中心学科竞赛", "https://etc.gdut.edu.cn/index/xkjs.htm", "竞赛"),
     ("蓝桥杯大赛官网", "https://dasai.lanqiao.cn/pages/v7/dasai/competition/individual_competition.html", "竞赛"),
     ("国际合作与交流处", "https://wsc.gdut.edu.cn/", "出国"),
     ("就业信息网", "https://career.gdut.edu.cn/campus/index", "实习"),

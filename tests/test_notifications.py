@@ -265,6 +265,24 @@ class SourceHealthTests(unittest.TestCase):
         </div></li></ul>{pagination}
         """
 
+    def test_engineering_training_competition_source_parses_competition_notice(self):
+        source = next(item for item in watcher.SOURCES if item[0] == "工程训练中心学科竞赛")
+        html = '<a href="/info/1034/2115.htm">关于举办2026年广东省大学生工程实践与创新能力大赛的通知</a>'
+
+        with (
+            patch.object(watcher, "SOURCES", [source]),
+            patch.object(watcher, "fetch", return_value=html),
+        ):
+            notices, errors = watcher.check_all()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("工程实践与创新能力大赛", notices[0].title)
+        self.assertEqual(
+            notices[0].url,
+            "https://etc.gdut.edu.cn/info/1034/2115.htm",
+        )
+
     def test_verification_page_is_reported_as_a_fetch_failure(self):
         response = BytesIO("<html>请完成人机验证后继续</html>".encode("utf-8"))
         response.headers = Message()
