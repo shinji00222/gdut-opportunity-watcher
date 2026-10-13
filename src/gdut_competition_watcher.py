@@ -298,7 +298,10 @@ def extract_career_competition_notices(html: str, base_url: str) -> list[Notice]
         raise ValueError("页面中没有可解析的赛事卡片，可能网站结构已变化")
     notices = []
     for card in parser.cards:
-        if any(marker in card["title"] for marker in NON_ACTIONABLE_COMPETITION_MARKERS):
+        if (
+            any(marker in card["title"] for marker in NON_ACTIONABLE_COMPETITION_MARKERS)
+            or notice_is_stale_competition({"category": "竞赛", "title": card["title"]})
+        ):
             continue
         detail = "\n".join(card["paragraphs"])
         url = urllib.parse.urljoin(base_url, f"/competition/view/competition_id/{card['id']}")
@@ -864,8 +867,8 @@ def notice_is_stale_competition(notice: dict, today: date | None = None) -> bool
     title = str(notice.get("title", ""))
     if any(marker in title for marker in NON_ACTIONABLE_COMPETITION_MARKERS):
         return True
-    year = re.search(r"(?<!\d)(20\d{2})(?!\d)", title)
-    return bool(year and int(year.group(1)) < today.year - 1)
+    years = [int(value) for value in re.findall(r"(?<!\d)(20\d{2})(?!\d)", title)]
+    return bool(years and max(years) < today.year)
 
 
 def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str]:
