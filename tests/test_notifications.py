@@ -7,9 +7,97 @@ from datetime import date, datetime, timedelta
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
+import urllib.parse
 from unittest.mock import patch
 
 from src import gdut_competition_watcher as watcher
+
+
+class InternationalInternshipPlatformTests(unittest.TestCase):
+    def test_public_job_feed_builds_notices_with_dates_and_stable_urls(self):
+        publish_date = int(datetime(2026, 10, 12).timestamp() * 1000)
+        deadline = int(datetime(2026, 11, 30).timestamp() * 1000)
+        payload = json.dumps([{
+            "id": "public-job-123",
+            "title": "Research Intern &amp; Data Analyst",
+            "orgName": "United Nations Example Office",
+            "address": "Geneva, Switzerland",
+            "publishDate": publish_date,
+            "endDate": deadline,
+            "status": "1",
+        }])
+        second_payload = json.dumps([{
+            "id": "closing-soon-456",
+            "title": "Policy Intern",
+            "orgName": "Example Organization",
+            "address": "Remote",
+            "publishDate": publish_date,
+            "endDate": int(datetime(2026, 10, 20).timestamp() * 1000),
+            "status": "1",
+        }])
+
+        with patch.object(watcher, "fetch", side_effect=[payload, second_payload]) as fetch:
+            notices = watcher.fetch_international_internship_notices()
+
+        self.assertEqual(len(notices), 2)
+        notice = notices[0]
+        self.assertEqual(notice.category, "实习")
+        self.assertEqual(notice.title, "Research Intern & Data Analyst")
+        self.assertEqual(notice.url, "https://gj.ncss.cn/job/public-job-123.html")
+        self.assertIn("United Nations Example Office", notice.summary)
+        self.assertEqual(
+            watcher.extract_registration_deadline(asdict(notice), date(2026, 10, 13)),
+            date(2026, 11, 30),
+        )
+        queries = [urllib.parse.parse_qs(urllib.parse.urlparse(call.args[0]).query) for call in fetch.call_args_list]
+        self.assertEqual([query["page"] for query in queries], [["0"], ["1"]])
+        self.assertTrue(all(query["jobType"] == ["实习"] and query["size"] == ["20"] for query in queries))
+        self.assertEqual(watcher.classify("2027 INTERN Data Analyst", None), "实习")
+        self.assertIsNone(watcher.classify("Internal Audit Engineer", None))
+
+    def test_check_all_routes_platform_source_to_the_json_feed(self):
+        source = (
+            watcher.INTERNATIONAL_INTERNSHIP_SOURCE,
+            watcher.INTERNATIONAL_INTERNSHIP_URL,
+            "实习",
+        )
+        expected = watcher.Notice(
+            id="platform-job", title="Research Intern", url="https://gj.ncss.cn/job/example.html",
+            source=watcher.INTERNATIONAL_INTERNSHIP_SOURCE, category="实习",
+        )
+
+        with (
+            patch.object(watcher, "SOURCES", [source]),
+            patch.object(watcher, "fetch_international_internship_notices", return_value=[expected]) as fetch_jobs,
+            patch.object(watcher, "fetch") as fetch_page,
+        ):
+            notices, errors = watcher.check_all()
+
+        self.assertEqual(notices, [expected])
+        self.assertEqual(errors, [])
+        fetch_jobs.assert_called_once_with()
+        fetch_page.assert_not_called()
+
+    def test_english_internship_eligibility_paragraphs_are_extracted(self):
+        html = """
+        <p>Applicants must meet the following eligibility requirements before applying.</p>
+        <p>Applicants must be currently enrolled in a graduate programme.</p>
+        <p>Strong research and communication skills are required for this position.</p>
+        """
+
+        _summary, detail, conditions = watcher.extract_detail_data(html, "Research Intern")
+
+        self.assertTrue(detail)
+        self.assertTrue(any("eligibility requirements" in item for item in conditions))
+        self.assertTrue(any("currently enrolled" in item for item in conditions))
+
+    def test_invalid_or_empty_job_payload_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "无效 JSON"):
+            watcher.extract_international_internship_notices("not-json")
+        self.assertEqual(watcher.extract_international_internship_notices("[]"), [])
+        with patch.object(watcher, "fetch", return_value="[]"):
+            with self.assertRaisesRegex(ValueError, "未返回可解析岗位"):
+                watcher.fetch_international_internship_notices()
 
 
 LANQIAO_HTML = """
@@ -85,6 +173,20 @@ class CheckCoordinationTests(unittest.TestCase):
 
         self.assertEqual(len(selected), watcher.MAX_DETAIL_TARGETS)
         self.assertEqual({notice.id for notice in selected[:12]}, {notice.id for notice in never_attempted})
+
+    def test_closer_deadline_is_prioritized_within_unattempted_details(self):
+        farther = watcher.Notice(
+            id="farther", title="实习申请通知", url="https://example.com/farther",
+            source="测试来源", summary="申请截止日期：2026年12月31日。",
+        )
+        closer = watcher.Notice(
+            id="closer", title="实习申请通知", url="https://example.com/closer",
+            source="测试来源", summary="申请截止日期：2026年10月14日。",
+        )
+
+        selected = watcher.select_detail_targets([farther, closer])
+
+        self.assertEqual([notice.id for notice in selected], ["closer", "farther"])
 
     def test_seen_notice_deadline_change_is_refreshed_and_notified_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:

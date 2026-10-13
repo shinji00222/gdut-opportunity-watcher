@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import html as html_lib
 import json
 import os
 import re
@@ -30,6 +31,8 @@ MAX_LOG_BYTES = 1024 * 1024
 DETAIL_REFRESH_INTERVAL = timedelta(days=7)
 DETAIL_RETRY_INTERVAL = timedelta(days=1)
 MAX_DETAIL_TARGETS = 30
+INTERNATIONAL_INTERNSHIP_SOURCE = "国际组织实习平台"
+INTERNATIONAL_INTERNSHIP_URL = "https://gj.ncss.cn/job.html"
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -45,6 +48,7 @@ SOURCES = [
     ("蓝桥杯大赛官网", "https://dasai.lanqiao.cn/pages/v7/dasai/competition/individual_competition.html", "竞赛"),
     ("国际合作与交流处", "https://wsc.gdut.edu.cn/", "出国"),
     ("就业信息网", "https://career.gdut.edu.cn/campus/index", "实习"),
+    (INTERNATIONAL_INTERNSHIP_SOURCE, INTERNATIONAL_INTERNSHIP_URL, "实习"),
 ]
 
 CATEGORY_KEYWORDS = {
@@ -291,6 +295,81 @@ def extract_career_competition_notices(html: str, base_url: str) -> list[Notice]
             detail_text=detail,
         ))
     return notices
+
+
+def _international_platform_date(value) -> str:
+    if not isinstance(value, (int, float)) or value <= 0:
+        return ""
+    try:
+        timestamp = value / 1000 if value > 100_000_000_000 else value
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def extract_international_internship_notices(payload: str) -> list[Notice]:
+    try:
+        rows = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("国际组织实习平台岗位接口返回了无效 JSON") from exc
+    if not isinstance(rows, list):
+        raise ValueError("国际组织实习平台岗位接口格式异常")
+
+    notices = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        job_id = str(row.get("id", "")).strip()
+        title = " ".join(html_lib.unescape(str(row.get("title", ""))).split())
+        if not job_id or not title:
+            continue
+        job_url = urllib.parse.urljoin(
+            INTERNATIONAL_INTERNSHIP_URL,
+            f"/job/{urllib.parse.quote(job_id, safe='')}.html",
+        )
+        publish_date = _international_platform_date(row.get("publishDate"))
+        deadline = _international_platform_date(row.get("endDate"))
+        organization = " ".join(html_lib.unescape(str(row.get("orgName", ""))).split())
+        location = " ".join(html_lib.unescape(str(row.get("address", ""))).split())
+        details = [part for part in (organization, location) if part]
+        if publish_date:
+            details.append(f"发布日期：{publish_date}")
+        if deadline:
+            details.append(f"截止日期：{deadline}")
+        summary = "；".join(details) or "岗位详情请打开国际组织实习平台原文查看。"
+        notice_id = hashlib.sha256(job_url.encode("utf-8")).hexdigest()[:20]
+        notices.append(Notice(
+            id=notice_id,
+            title=title,
+            url=job_url,
+            source=INTERNATIONAL_INTERNSHIP_SOURCE,
+            date=publish_date,
+            summary=summary,
+            category="实习",
+        ))
+    return notices
+
+
+def fetch_international_internship_notices() -> list[Notice]:
+    endpoint = urllib.parse.urljoin(INTERNATIONAL_INTERNSHIP_URL, "/job/job.json")
+    notices_by_id = {}
+    for page in (0, 1):
+        params = urllib.parse.urlencode({
+            "page": page,
+            "size": 20,
+            "key": "",
+            "orgField": "",
+            "jobType": "实习",
+            "jobField": "",
+            "jobGrade": "",
+            "eduLevel": "",
+            "area": "",
+        })
+        notices = extract_international_internship_notices(fetch(f"{endpoint}?{params}"))
+        notices_by_id.update((notice.id, notice) for notice in notices)
+    if not notices_by_id:
+        raise ValueError("国际组织实习平台未返回可解析岗位，可能接口或筛选结构已变化")
+    return list(notices_by_id.values())
 
 
 def log(text: str) -> None:
@@ -622,9 +701,13 @@ def select_detail_targets(notices: list[Notice]) -> list[Notice]:
             or detail_refresh_due(n.detail_checked_at, n.detail_attempted_at)
         )
     ]
-    # 未尝试过的通知先处理，避免重复失败的旧详情长期占满每批的前 30 个位置。
+    # 先处理未尝试项，再按截止日从近到远处理，避免旧失败项或远期岗位挡住紧急机会。
     eligible.sort(key=lambda n: (
-        bool(n.detail_attempted_at), n.detail_attempted_at, n.first_seen, n.id
+        bool(n.detail_attempted_at),
+        extract_registration_deadline(asdict(n)) or date.max,
+        n.detail_attempted_at,
+        n.first_seen,
+        n.id,
     ))
     return eligible[:MAX_DETAIL_TARGETS]
 
@@ -730,6 +813,8 @@ def fetch(url: str) -> str:
 def classify(title: str, source_default: str | None) -> str | None:
     # 国际组织实习等交叉项目优先归到“实习”。
     normalized_title = title.casefold()
+    if re.search(r"\bintern(?:ship)?\b", normalized_title):
+        return "实习"
     for category in ("实习", "出国", "竞赛"):
         if any(k.casefold() in normalized_title for k in CATEGORY_KEYWORDS[category]):
             return category
@@ -796,16 +881,24 @@ def extract_detail_data(html: str, title: str) -> tuple[str, str, list[str]]:
         "参赛对象", "报名条件", "申请条件", "申请资格", "资格要求", "招募对象", "选拔条件",
         "报名要求", "申报条件", "基本要求", "任职要求", "岗位要求", "专业要求", "语言要求",
         "成绩要求", "报名资格", "申请人须", "申请者须", "应聘要求", "限本科", "限研究生",
+        "qualifications", "requirements", "eligibility", "education", "experience",
+        "languages", "competencies", "skills", "enrolled in", "currently pursuing",
+        "applicants must", "must be enrolled", "minimum education", "degree in",
     )
+
+    def has_condition_marker(value: str) -> bool:
+        normalized = value.casefold()
+        return any(marker.casefold() in normalized for marker in condition_markers)
+
     hard_conditions: list[str] = []
     capture_following = 0
     for paragraph in candidates:
         # 将过长段落按句号切开，保留包含条件标志的句子及其相邻短句。
         pieces = re.split(r"(?<=[。；;])", paragraph)
-        paragraph_has_marker = any(marker in paragraph for marker in condition_markers)
+        paragraph_has_marker = has_condition_marker(paragraph)
         for piece in pieces:
             piece = piece.strip()
-            should_capture = any(marker in piece for marker in condition_markers) or capture_following > 0
+            should_capture = has_condition_marker(piece) or capture_following > 0
             if 8 <= len(piece) <= 500 and should_capture:
                 if piece not in hard_conditions:
                     hard_conditions.append(piece)
@@ -830,6 +923,8 @@ def check_all() -> tuple[list[Notice], list[str]]:
     def load_source(item):
         source, url, source_default = item
         try:
+            if source == INTERNATIONAL_INTERNSHIP_SOURCE:
+                return source, fetch_international_internship_notices(), ""
             html = fetch(url)
             if source == "学生就业指导中心赛事":
                 items = extract_career_competition_notices(html, url)
