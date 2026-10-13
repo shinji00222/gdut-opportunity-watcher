@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -132,6 +132,39 @@ class SourceHealthTests(unittest.TestCase):
     def test_page_without_links_is_reported_instead_of_silent_empty_success(self):
         with self.assertRaisesRegex(ValueError, "没有可解析的链接"):
             watcher.extract_notices("测试来源", "https://example.com", "<html><body>动态页面</body></html>")
+
+    def test_career_page_without_cards_is_reported_as_source_failure(self):
+        with self.assertRaisesRegex(ValueError, "没有可解析的赛事卡片"):
+            watcher.extract_career_competition_notices(
+                '<a href="/competition/competitions/page/2">2</a>',
+                "https://career.gdut.edu.cn/competition/competitions",
+            )
+
+    def test_archived_and_non_event_links_are_filtered(self):
+        html = """
+        <a href="/old">2019年广东省工科大学生实验综合技能竞赛</a>
+        <a href="/current">2025年大学生数学竞赛报名通知</a>
+        <a href="/nav">创新创业教育</a>
+        <a href="/logistics">竞赛场地、就餐地点及住宿信息</a>
+        """
+        notices = watcher.extract_notices(
+            "测试竞赛", "https://example.com", html, "竞赛", today=date(2026, 10, 13)
+        )
+        self.assertEqual([notice.title for notice in notices], ["2025年大学生数学竞赛报名通知"])
+
+    def test_pruning_archives_removes_stale_items_and_favorites(self):
+        state = {
+            "notices": [
+                {"id": "old", "title": "2019年大学生竞赛", "category": "竞赛"},
+                {"id": "noise", "title": "创新创业教育", "category": "竞赛"},
+                {"id": "current", "title": "2025年大学生竞赛", "category": "竞赛"},
+            ],
+            "favorites": ["old", "noise", "current"],
+        }
+        removed = watcher.prune_irrelevant_notices(state, date(2026, 10, 13))
+        self.assertEqual(set(removed), {"old", "noise"})
+        self.assertEqual([item["id"] for item in state["notices"]], ["current"])
+        self.assertEqual(state["favorites"], ["current"])
 
     def test_career_competition_javascript_cards_and_pagination_are_parsed(self):
         first_page = self._career_page(

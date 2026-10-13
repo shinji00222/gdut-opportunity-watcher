@@ -57,7 +57,10 @@ CATEGORY_KEYWORDS = {
     ),
 }
 KEYWORDS = tuple(dict.fromkeys(k for values in CATEGORY_KEYWORDS.values() for k in values))
-IGNORE_WORDS = ("教师教学创新大赛", "教职工", "体育比赛成绩")
+IGNORE_WORDS = (
+    "教师教学创新大赛", "教职工", "体育比赛成绩", "创新创业教育",
+    "竞赛场地", "就餐地点", "住宿信息",
+)
 
 
 @dataclass
@@ -257,6 +260,8 @@ def extract_lanqiao_registration_notice(html: str, now: datetime | None = None) 
 def extract_career_competition_notices(html: str, base_url: str) -> list[Notice]:
     parser = CareerCompetitionParser()
     parser.feed(html)
+    if not parser.cards:
+        raise ValueError("页面中没有可解析的赛事卡片，可能网站结构已变化")
     notices = []
     for card in parser.cards:
         detail = "\n".join(card["paragraphs"])
@@ -461,6 +466,30 @@ def notice_is_registration_expired(notice: dict, today: date | None = None) -> b
     return bool(deadline and deadline < today)
 
 
+def notice_is_stale_competition(notice: dict, today: date | None = None) -> bool:
+    today = today or date.today()
+    if notice.get("category") != "竞赛":
+        return False
+    title = str(notice.get("title", ""))
+    year = re.search(r"(?<!\d)(20\d{2})(?!\d)", title)
+    return bool(year and int(year.group(1)) < today.year - 1)
+
+
+def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str]:
+    today = today or date.today()
+    notices = state.get("notices", [])
+    kept = [
+        notice for notice in notices
+        if not any(word in str(notice.get("title", "")) for word in IGNORE_WORDS)
+        and not notice_is_stale_competition(notice, today)
+    ]
+    removed_ids = {notice.get("id") for notice in notices} - {notice.get("id") for notice in kept}
+    if removed_ids:
+        state["notices"] = kept
+        state["favorites"] = [item for item in state.get("favorites", []) if item not in removed_ids]
+    return sorted(item for item in removed_ids if item)
+
+
 def prune_expired_notices(state: dict, today: date | None = None) -> list[str]:
     today = today or date.today()
     notices = state.get("notices", [])
@@ -502,7 +531,14 @@ def classify(title: str, source_default: str | None) -> str | None:
     return source_default if source_default and any(k.casefold() in normalized_title for k in KEYWORDS) else None
 
 
-def extract_notices(source: str, base_url: str, html: str, source_default: str | None = None) -> list[Notice]:
+def extract_notices(
+    source: str,
+    base_url: str,
+    html: str,
+    source_default: str | None = None,
+    today: date | None = None,
+) -> list[Notice]:
+    today = today or date.today()
     parser = LinkParser()
     parser.feed(html)
     if not parser.links:
@@ -515,14 +551,16 @@ def extract_notices(source: str, base_url: str, html: str, source_default: str |
             continue
         if any(k in title for k in IGNORE_WORDS):
             continue
+        if notice_is_stale_competition({"category": category, "title": title}, today):
+            continue
         url = urllib.parse.urljoin(base_url, href)
         if not url.startswith(("http://", "https://")):
             continue
         clean_url = url.split("#", 1)[0]
         nid = hashlib.sha256(clean_url.encode("utf-8")).hexdigest()[:20]
         date_match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", title)
-        date = "-".join(date_match.groups()) if date_match else ""
-        found[nid] = Notice(nid, title, clean_url, source, date, category=category)
+        published_date = "-".join(date_match.groups()) if date_match else ""
+        found[nid] = Notice(nid, title, clean_url, source, published_date, category=category)
     return list(found.values())
 
 
@@ -677,6 +715,7 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
         "last_error": "；".join(errors),
         "schema_version": 2,
     })
+    removed_irrelevant = prune_irrelevant_notices(state)
     removed_expired = prune_expired_notices(state)
     save_state(state)
     if notify and new_items and not first_run:
@@ -688,7 +727,10 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
             counts[item.category] = counts.get(item.category, 0) + 1
         category_text = "、".join(f"{k}{v}条" for k, v in counts.items())
         notify_windows(f"发现 {len(new_items)} 条新消息（{category_text}）", preview)
-    log(f"检查完成，发现 {len(current)} 条，新增 {0 if first_run else len(new_items)} 条，清理过期 {len(removed_expired)} 条，错误 {len(errors)} 个")
+    log(
+        f"检查完成，发现 {len(current)} 条，新增 {0 if first_run else len(new_items)} 条，"
+        f"清理过期 {len(removed_expired)} 条，清理归档/无关 {len(removed_irrelevant)} 条，错误 {len(errors)} 个"
+    )
     return ([] if first_run else new_items), errors, first_run
 
 
