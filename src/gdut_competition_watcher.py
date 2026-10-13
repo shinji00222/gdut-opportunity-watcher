@@ -29,6 +29,7 @@ MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
+_THREAD_STATE_LOCK = threading.Lock()
 
 SOURCES = [
     ("学校通知公告", "https://www.gdut.edu.cn/index/tzgg.htm", None),
@@ -295,6 +296,67 @@ def _empty_state() -> dict:
     return {"initialized": False, "seen": [], "notices": [], "favorites": [], "last_check": "从未", "last_error": ""}
 
 
+@contextmanager
+def _named_mutex(scope: str, blocking: bool):
+    """Coordinate short state transactions and long checks across app processes."""
+    thread_lock = _THREAD_CHECK_LOCK if scope == "Check" else _THREAD_STATE_LOCK
+    local_check_guard = False
+    if scope == "Check":
+        local_check_guard = thread_lock.acquire(blocking=False)
+        if not local_check_guard:
+            yield False
+            return
+
+    if os.name != "nt":
+        if scope == "Check":
+            try:
+                yield True
+            finally:
+                thread_lock.release()
+            return
+        acquired = thread_lock.acquire(blocking=blocking)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                thread_lock.release()
+        return
+
+    mutex_hash = hashlib.sha256(str(APP_DIR).casefold().encode("utf-8")).hexdigest()[:16]
+    mutex_name = f"Local\\GDUTCompetitionWatcher.{scope}.{mutex_hash}"
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "无法创建应用互斥锁")
+        timeout = 10_000 if blocking else 0
+        result = kernel32.WaitForSingleObject(handle, timeout)
+        acquired = result in (0, 0x80)  # WAIT_OBJECT_0 or WAIT_ABANDONED
+        if result == 0xFFFFFFFF:  # WAIT_FAILED
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise OSError(error, "无法等待应用互斥锁")
+        if not acquired:
+            kernel32.CloseHandle(handle)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+    finally:
+        if local_check_guard:
+            thread_lock.release()
+
+
 def _preserve_corrupt_state() -> None:
     if not STATE_FILE.exists():
         return
@@ -364,7 +426,7 @@ def load_state() -> dict:
         return _empty_state()
 
 
-def save_state(state: dict) -> None:
+def _write_state_atomic(state: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(prefix="state-", suffix=".tmp", dir=APP_DIR)
     try:
@@ -379,6 +441,24 @@ def save_state(state: dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def save_state(state: dict) -> None:
+    with _named_mutex("State", blocking=True) as acquired:
+        if not acquired:
+            raise TimeoutError("等待状态文件写入锁超时，请稍后重试")
+        _write_state_atomic(state)
+
+
+def update_state(mutator) -> dict:
+    """Apply a short read-modify-write transaction without losing another window's edits."""
+    with _named_mutex("State", blocking=True) as acquired:
+        if not acquired:
+            raise TimeoutError("等待状态文件写入锁超时，请稍后重试")
+        state = load_state()
+        mutator(state)
+        _write_state_atomic(state)
+        return state
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
@@ -678,36 +758,8 @@ def notify_windows(title: str, message: str) -> None:
 @contextmanager
 def _check_mutex():
     """Prevent a scheduled run and a manual run from overwriting each other's state."""
-    if os.name != "nt":
-        acquired = _THREAD_CHECK_LOCK.acquire(blocking=False)
-        try:
-            yield acquired
-        finally:
-            if acquired:
-                _THREAD_CHECK_LOCK.release()
-        return
-
-    mutex_hash = hashlib.sha256(str(APP_DIR).casefold().encode("utf-8")).hexdigest()[:16]
-    mutex_name = f"Local\\GDUTCompetitionWatcher.Check.{mutex_hash}"
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    ctypes.set_last_error(0)
-    handle = kernel32.CreateMutexW(None, True, mutex_name)
-    if not handle:
-        raise OSError(ctypes.get_last_error(), "无法创建检测互斥锁")
-    already_exists = ctypes.get_last_error() == 183
-    if already_exists:
-        kernel32.CloseHandle(handle)
-        yield False
-        return
-    try:
-        yield True
-    finally:
-        kernel32.ReleaseMutex(handle)
-        kernel32.CloseHandle(handle)
+    with _named_mutex("Check", blocking=False) as acquired:
+        yield acquired
 
 
 def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
@@ -769,9 +821,15 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
         "last_error": "；".join(errors),
         "schema_version": 2,
     })
-    removed_irrelevant = prune_irrelevant_notices(state)
-    removed_expired = prune_expired_notices(state)
-    save_state(state)
+    with _named_mutex("State", blocking=True) as acquired:
+        if not acquired:
+            raise TimeoutError("等待状态文件写入锁超时，请稍后重试")
+        latest_state = load_state()
+        state["profile"] = latest_state.get("profile", state.get("profile", {}))
+        state["favorites"] = latest_state.get("favorites", state.get("favorites", []))
+        removed_irrelevant = prune_irrelevant_notices(state)
+        removed_expired = prune_expired_notices(state)
+        _write_state_atomic(state)
     if notify and new_items and not first_run:
         preview = "；".join(n.title[:35] for n in new_items[:3])
         if len(new_items) > 3:
@@ -1091,14 +1149,19 @@ class MainWindow:
             self.open_selected()
 
     def toggle_favorite(self, notice_id: str):
-        state = load_state()
-        favorites = set(state.get("favorites", []))
-        if notice_id in favorites:
-            favorites.remove(notice_id)
-        else:
-            favorites.add(notice_id)
-        state["favorites"] = sorted(favorites)
-        save_state(state)
+        def toggle(state):
+            favorites = set(state.get("favorites", []))
+            if notice_id in favorites:
+                favorites.remove(notice_id)
+            else:
+                favorites.add(notice_id)
+            state["favorites"] = sorted(favorites)
+
+        try:
+            update_state(toggle)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"保存收藏失败，请重试。\n{exc}")
+            return
         self.refresh()
         if self.tree.exists(notice_id):
             self.tree.selection_set(notice_id)
@@ -1202,9 +1265,11 @@ class MainWindow:
         ProfileDialog(self.root, load_state().get("profile", {}), self.save_profile)
 
     def save_profile(self, profile: dict):
-        state = load_state()
-        state["profile"] = profile
-        save_state(state)
+        try:
+            update_state(lambda state: state.update({"profile": profile}))
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"保存个人档案失败，请重试。\n{exc}")
+            return
         self.refresh()
 
     def start_check(self):

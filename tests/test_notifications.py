@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from dataclasses import asdict
 from datetime import date, datetime
@@ -85,8 +86,72 @@ class CheckCoordinationTests(unittest.TestCase):
             with patch.object(watcher, "log"):
                 self.assertEqual(watcher.run_scheduled_check(), 1)
 
+    def test_check_commit_keeps_profile_and_favorites_saved_during_fetch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [],
+                "notices": [],
+                "favorites": [],
+                "profile": {"education": "本科生"},
+            }), encoding="utf-8")
+            notice = watcher.Notice(
+                id="new-notice", title="校内创新竞赛报名通知", url="https://example.com/event",
+                source="测试来源", summary="报名摘要", detail_text="报名时间和参赛要求。",
+                hard_conditions=["本科生可报名"],
+            )
+
+            def save_edits_during_fetch():
+                watcher.update_state(lambda state: state.update({
+                    "profile": {"education": "本科生", "major": "计算机"},
+                    "favorites": ["user-favorite"],
+                }))
+                return [notice], []
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", side_effect=save_edits_during_fetch),
+            ):
+                watcher.run_check(notify=False)
+                saved = watcher.load_state()
+
+        self.assertEqual(saved["profile"]["major"], "计算机")
+        self.assertEqual(saved["favorites"], ["user-favorite"])
+        self.assertEqual([item["id"] for item in saved["notices"]], ["new-notice"])
+
 
 class StateFileSafetyTests(unittest.TestCase):
+    def test_concurrent_state_transactions_preserve_both_updates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+            ):
+                watcher.save_state({"initialized": True, "profile": {}, "favorites": []})
+                barrier = threading.Barrier(2)
+
+                def write_profile(key):
+                    barrier.wait()
+                    watcher.update_state(lambda state: state.setdefault("profile", {}).update({key: key}))
+
+                workers = [threading.Thread(target=write_profile, args=(key,)) for key in ("major", "college")]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=5)
+                self.assertTrue(all(not worker.is_alive() for worker in workers))
+                saved = watcher.load_state()
+
+        self.assertEqual(saved["profile"], {"major": "major", "college": "college"})
+
     def test_corrupt_state_is_preserved_and_save_replaces_atomically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
