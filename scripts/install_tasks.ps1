@@ -11,6 +11,9 @@ $exeTarget = Join-Path $appDir "GDUTCompetitionWatcher.exe"
 if (-not (Test-Path -LiteralPath $exeSource)) {
     throw "找不到 GDUTCompetitionWatcher.exe，请从完整发布包内运行此脚本。"
 }
+if (Get-Process -Name "GDUTCompetitionWatcher" -ErrorAction SilentlyContinue) {
+    throw "请先关闭广工竞赛提醒，再重新运行安装程序。"
+}
 
 New-Item -ItemType Directory -Path $appDir -Force | Out-Null
 Copy-Item -LiteralPath $exeSource -Destination $exeTarget -Force

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
@@ -22,6 +23,8 @@ APP_NAME = "广工竞赛提醒"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "GDUTCompetitionWatcher"
 STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "watcher.log"
+MAX_PAGE_BYTES = 8 * 1024 * 1024
+MAX_LOG_BYTES = 1024 * 1024
 
 SOURCES = [
     ("学校通知公告", "https://www.gdut.edu.cn/index/tzgg.htm", None),
@@ -55,7 +58,6 @@ CATEGORY_KEYWORDS = {
 }
 KEYWORDS = tuple(dict.fromkeys(k for values in CATEGORY_KEYWORDS.values() for k in values))
 IGNORE_WORDS = ("教师教学创新大赛", "教职工", "体育比赛成绩")
-DEADLINE_KEYWORDS = ("报名", "申报", "申请", "提交", "截止", "截至")
 
 
 @dataclass
@@ -70,6 +72,7 @@ class Notice:
     category: str = "竞赛"
     detail_text: str = ""
     hard_conditions: list[str] = field(default_factory=list)
+    lifecycle_stage: str = ""
 
 
 class LinkParser(HTMLParser):
@@ -95,6 +98,59 @@ class LinkParser(HTMLParser):
                 self.links.append((self.href, text))
             self.href = None
             self.parts = []
+
+
+class CareerCompetitionParser(HTMLParser):
+    """Read the public competition cards whose title anchors use javascript:void()."""
+    def __init__(self):
+        super().__init__()
+        self.card: dict | None = None
+        self.title_parts: list[str] = []
+        self.paragraph_parts: list[str] | None = None
+        self.in_title = False
+        self.cards: list[dict] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "li":
+            self._finish_card()
+            self.card = {"id": "", "title": "", "paragraphs": []}
+        elif self.card is not None and tag.lower() == "div":
+            match = re.search(r"gotoDetail\((\d+)\)", attrs.get("onclick", ""))
+            if match:
+                self.card["id"] = match.group(1)
+        elif self.card is not None and tag.lower() == "a" and "title" in attrs.get("class", "").split():
+            self.in_title = True
+            self.title_parts = []
+        elif self.card is not None and tag.lower() == "p":
+            self.paragraph_parts = []
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.paragraph_parts is not None:
+            self.paragraph_parts.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "a" and self.in_title:
+            self.card["title"] = re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+            self.in_title = False
+            self.title_parts = []
+        elif tag == "p" and self.paragraph_parts is not None:
+            paragraph = re.sub(r"\s+", " ", "".join(self.paragraph_parts)).strip()
+            if paragraph:
+                self.card["paragraphs"].append(paragraph)
+            self.paragraph_parts = None
+        elif tag == "li":
+            self._finish_card()
+
+    def _finish_card(self):
+        if self.card and self.card.get("id") and self.card.get("title"):
+            self.cards.append(self.card)
+        self.card = None
+        self.in_title = False
+        self.paragraph_parts = None
 
 
 class ParagraphParser(HTMLParser):
@@ -151,7 +207,7 @@ class VisibleTextParser(HTMLParser):
                 self.parts.append(clean)
 
 
-def extract_lanqiao_registration_notice(html: str) -> Notice | None:
+def extract_lanqiao_registration_notice(html: str, now: datetime | None = None) -> Notice | None:
     """Turn the Lanqiao official registration window into a season-specific notice."""
     parser = VisibleTextParser()
     parser.feed(html)
@@ -169,12 +225,17 @@ def extract_lanqiao_registration_notice(html: str) -> Notice | None:
     period = (f"{start_year}年{int(start_month)}月{int(start_day)}日 {start_time} 至 "
               f"{end_year}年{int(end_month)}月{int(end_day)}日 {end_time}")
     source_url = next(url for name, url, _ in SOURCES if name == "蓝桥杯大赛官网")
-    today = date.today().isoformat()
-    if today < start_date:
+    now = now or datetime.now()
+    start_at = datetime.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M")
+    end_at = datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+    if now < start_at:
+        lifecycle_stage = "upcoming"
         title = f"{start_year}年蓝桥杯报名将于{int(start_month)}月{int(start_day)}日开始"
-    elif today <= end_date:
+    elif now <= end_at:
+        lifecycle_stage = "open"
         title = f"{start_year}年蓝桥杯报名已开放（截止{int(end_month)}月{int(end_day)}日）"
     else:
+        lifecycle_stage = "closed"
         title = f"{start_year}年蓝桥杯报名已截止"
     notice_id = hashlib.sha256(f"{source_url}|{start_date}".encode("utf-8")).hexdigest()[:20]
     return Notice(
@@ -189,18 +250,85 @@ def extract_lanqiao_registration_notice(html: str) -> Notice | None:
                      f"{end_year}年{int(end_month)}月{int(end_day)}日 {end_time}。"
                      "报名、缴费及准考证等事项以蓝桥杯官网说明为准。"),
         hard_conditions=["报名组别及参赛资格请以蓝桥杯大赛官网当届通知为准。"],
+        lifecycle_stage=lifecycle_stage,
     )
+
+
+def extract_career_competition_notices(html: str, base_url: str) -> list[Notice]:
+    parser = CareerCompetitionParser()
+    parser.feed(html)
+    notices = []
+    for card in parser.cards:
+        detail = "\n".join(card["paragraphs"])
+        url = urllib.parse.urljoin(base_url, f"/competition/view/competition_id/{card['id']}")
+        notice_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+        notices.append(Notice(
+            id=notice_id,
+            title=card["title"],
+            url=url,
+            source="学生就业指导中心赛事",
+            summary=detail[:220],
+            category="竞赛",
+            detail_text=detail,
+        ))
+    return notices
+
 
 def log(text: str) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size >= MAX_LOG_BYTES:
+        os.replace(LOG_FILE, LOG_FILE.with_name(f"{LOG_FILE.name}.1"))
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+
+
+def _empty_state() -> dict:
+    return {"initialized": False, "seen": [], "notices": [], "favorites": [], "last_check": "从未", "last_error": ""}
+
+
+def _preserve_corrupt_state() -> None:
+    if not STATE_FILE.exists():
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = STATE_FILE.with_name(f"state.corrupt-{stamp}.json")
+    suffix = 1
+    while backup.exists():
+        backup = STATE_FILE.with_name(f"state.corrupt-{stamp}-{suffix}.json")
+        suffix += 1
+    os.replace(STATE_FILE, backup)
+    log(f"状态文件格式无效，已保留副本：{backup.name}")
 
 
 def load_state() -> dict:
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        valid_state = isinstance(state, dict)
+        valid_state = valid_state and isinstance(state.get("notices", []), list)
+        valid_state = valid_state and isinstance(state.get("profile", {}), dict)
+        valid_state = valid_state and isinstance(state.get("seen", []), list)
+        valid_state = valid_state and isinstance(state.get("favorites", []), list)
+        if valid_state:
+            valid_state = all(isinstance(item, str) for item in state.get("seen", []))
+            valid_state = valid_state and all(isinstance(item, str) for item in state.get("favorites", []))
+            valid_state = valid_state and all(
+                isinstance(notice, dict)
+                and all(isinstance(notice.get(key), str) for key in ("id", "title", "url", "source"))
+                for notice in state.get("notices", [])
+            )
+        profile = state.get("profile", {}) if isinstance(state, dict) else {}
+        if valid_state:
+            valid_state = all(value is None or isinstance(value, (str, int, float)) for value in profile.values())
+        if not valid_state:
+            _preserve_corrupt_state()
+            return _empty_state()
+        for key, value in profile.items():
+            profile[key] = "" if value is None else str(value)
         for notice in state.get("notices", []):
+            for key in ("date", "first_seen", "summary", "detail_text", "category", "lifecycle_stage"):
+                if key in notice and not isinstance(notice[key], str):
+                    notice[key] = str(notice[key] or "")
+            if not isinstance(notice.get("hard_conditions", []), list):
+                notice["hard_conditions"] = []
             if notice.get("category") == "出国交流":
                 notice["category"] = "出国"
             if not notice.get("hard_conditions"):
@@ -213,13 +341,28 @@ def load_state() -> dict:
                 pass
             profile.pop("graduation_year", None)
         return state
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"initialized": False, "seen": [], "notices": [], "favorites": [], "last_check": "从未", "last_error": ""}
+    except FileNotFoundError:
+        return _empty_state()
+    except json.JSONDecodeError:
+        _preserve_corrupt_state()
+        return _empty_state()
 
 
 def save_state(state: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd, temporary_path = tempfile.mkstemp(prefix="state-", suffix=".tmp", dir=APP_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
@@ -230,8 +373,22 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
 
 
 def _deadline_context_is_relevant(text: str, start: int, end: int) -> bool:
-    context = text[max(0, start - 24):min(len(text), end + 24)]
-    return any(keyword in context for keyword in DEADLINE_KEYWORDS)
+    prefix = text[max(0, start - 36):start]
+    suffix = text[end:min(len(text), end + 18)]
+    explicit_deadline_before = re.search(
+        r"(?:报名|申报|申请|提交|材料)?(?:截止|截至)(?:时间|日期)?\s*(?:为|是|：|:|到)?\s*$",
+        prefix,
+    )
+    explicit_deadline_after = re.match(
+        r"\s*(?:前|之前|截止(?:前)?|为止)(?:报名|申报|申请|提交|缴费)?",
+        suffix,
+    )
+    return bool(explicit_deadline_before or explicit_deadline_after)
+
+
+def _registration_range_context(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 30):start]
+    return bool(re.search(r"(?:报名|申报|申请)(?:时间|日期|期限)\s*(?:为|是|：|:)?\s*$", prefix))
 
 
 def extract_registration_deadline(notice: dict, today: date | None = None) -> date | None:
@@ -245,6 +402,22 @@ def extract_registration_deadline(notice: dict, today: date | None = None) -> da
         return None
 
     deadlines: list[date] = []
+    reference_year = today.year
+    source_date = re.search(r"(20\d{2})", str(notice.get("date", "")))
+    if source_date:
+        reference_year = int(source_date.group(1))
+    covered_ranges: list[tuple[int, int]] = []
+    full_range_pattern = re.compile(
+        r"(20\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})\s*(?:日|号)?\s*(?:\d{1,2}:\d{2})?\s*"
+        r"(?:至|到|[-~～—])\s*(20\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})\s*(?:日|号)?"
+    )
+    for match in full_range_pattern.finditer(text):
+        if not _registration_range_context(text, match.start()):
+            continue
+        parsed = _safe_date(int(match.group(4)), int(match.group(5)), int(match.group(6)))
+        if parsed:
+            deadlines.append(parsed)
+            covered_ranges.append(match.span())
     range_same_month_pattern = re.compile(
         r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?\s*"
         r"(?:至|到|[-~～—])\s*(?!20\d{2})(\d{1,2})\s*(?:日|号)?"
@@ -253,13 +426,16 @@ def extract_registration_deadline(notice: dict, today: date | None = None) -> da
     month_day_pattern = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?")
 
     for match in range_same_month_pattern.finditer(text):
-        if not _deadline_context_is_relevant(text, match.start(), match.end()):
+        if not _registration_range_context(text, match.start()):
             continue
-        parsed = _safe_date(int(match.group(1) or today.year), int(match.group(2)), int(match.group(4)))
+        parsed = _safe_date(int(match.group(1) or reference_year), int(match.group(2)), int(match.group(4)))
         if parsed:
             deadlines.append(parsed)
+            covered_ranges.append(match.span())
 
     for match in full_date_pattern.finditer(text):
+        if any(start <= match.start() < end for start, end in covered_ranges):
+            continue
         if not _deadline_context_is_relevant(text, match.start(), match.end()):
             continue
         parsed = _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -268,11 +444,11 @@ def extract_registration_deadline(notice: dict, today: date | None = None) -> da
 
     occupied_ranges = [match.span() for match in full_date_pattern.finditer(text)]
     for match in month_day_pattern.finditer(text):
-        if any(start <= match.start() < end for start, end in occupied_ranges):
+        if any(start <= match.start() < end for start, end in occupied_ranges + covered_ranges):
             continue
         if not _deadline_context_is_relevant(text, match.start(), match.end()):
             continue
-        parsed = _safe_date(today.year, int(match.group(1)), int(match.group(2)))
+        parsed = _safe_date(reference_year, int(match.group(1)), int(match.group(2)))
         if parsed:
             deadlines.append(parsed)
 
@@ -302,12 +478,19 @@ def fetch(url: str) -> str:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GDUT-Competition-Watcher/1.0"
     })
     with urllib.request.urlopen(req, timeout=20) as response:
-        raw = response.read()
+        raw = response.read(MAX_PAGE_BYTES + 1)
+        if len(raw) > MAX_PAGE_BYTES:
+            raise ValueError(f"网页超过 {MAX_PAGE_BYTES // (1024 * 1024)} MB，已停止读取")
         encoding = response.headers.get_content_charset() or "utf-8"
     try:
-        return raw.decode(encoding)
+        html = raw.decode(encoding)
     except UnicodeDecodeError:
-        return raw.decode("gb18030", errors="replace")
+        html = raw.decode("gb18030", errors="replace")
+    if re.search(r"安全验证|人机验证|请输入验证码|访问过于频繁|403 Forbidden|Access Denied", html, re.I):
+        raise ValueError("网站返回了访问验证或拦截页面，暂时无法采集")
+    if not html.strip():
+        raise ValueError("网站返回空页面")
+    return html
 
 
 def classify(title: str, source_default: str | None) -> str | None:
@@ -322,6 +505,8 @@ def classify(title: str, source_default: str | None) -> str | None:
 def extract_notices(source: str, base_url: str, html: str, source_default: str | None = None) -> list[Notice]:
     parser = LinkParser()
     parser.feed(html)
+    if not parser.links:
+        raise ValueError("页面中没有可解析的链接，可能网站结构已变化或内容由脚本动态加载")
     found: dict[str, Notice] = {}
     for href, title in parser.links:
         title = re.sub(r"[\u200b\ufeff]", "", title).strip(" -|·")
@@ -396,7 +581,25 @@ def check_all() -> tuple[list[Notice], list[str]]:
         source, url, source_default = item
         try:
             html = fetch(url)
-            items = extract_notices(source, url, html, source_default)
+            if source == "学生就业指导中心赛事":
+                items = extract_career_competition_notices(html, url)
+                parser = LinkParser()
+                parser.feed(html)
+                page_urls = []
+                page_errors = []
+                for href, _title in parser.links:
+                    if re.search(r"/page/\d+(?:/|$)", href):
+                        page_url = urllib.parse.urljoin(url, href)
+                        if urllib.parse.urlparse(page_url).netloc == "career.gdut.edu.cn" and page_url not in page_urls:
+                            page_urls.append(page_url)
+                for page_url in page_urls[:3]:
+                    try:
+                        items.extend(extract_career_competition_notices(fetch(page_url), page_url))
+                    except Exception as exc:
+                        page_errors.append(f"分页读取失败：{exc}")
+                return source, items, "；".join(page_errors)
+            else:
+                items = extract_notices(source, url, html, source_default)
             if source == "蓝桥杯大赛官网":
                 registration_notice = extract_lanqiao_registration_notice(html)
                 if registration_notice:
@@ -433,9 +636,12 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
     for n in current:
         old = old_by_id.get(n.id, {})
         n.first_seen = old.get("first_seen", now)
-        n.summary = old.get("summary", "")
-        n.detail_text = old.get("detail_text", "")
-        n.hard_conditions = old.get("hard_conditions", [])
+        if n.source != "蓝桥杯大赛官网":
+            n.summary = old.get("summary", "")
+            n.detail_text = old.get("detail_text", "")
+            n.hard_conditions = old.get("hard_conditions", [])
+    # 先用列表页已有的截止信息过滤，减少过期竞赛详情页请求；未知截止日仍读取正文。
+    current = [n for n in current if not notice_is_registration_expired(asdict(n))]
     # 新通知和尚未采集过正文的旧通知才读取详情，每轮最多30条。
     detail_targets = [n for n in current if not n.detail_text or not n.hard_conditions][:30]
     def load_detail(n: Notice):
@@ -451,7 +657,15 @@ def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
         with ThreadPoolExecutor(max_workers=min(6, len(detail_targets))) as pool:
             list(pool.map(load_detail, detail_targets))
     current = [n for n in current if not notice_is_registration_expired(asdict(n))]
-    new_items = [n for n in current if n.id not in seen]
+    new_items = [
+        n for n in current
+        if n.id not in seen
+        or (
+            n.source == "蓝桥杯大赛官网"
+            and n.lifecycle_stage == "open"
+            and old_by_id.get(n.id, {}).get("lifecycle_stage") != "open"
+        )
+    ]
     for n in current:
         old_by_id[n.id] = asdict(n)
     merged = list(old_by_id.values())[-500:]

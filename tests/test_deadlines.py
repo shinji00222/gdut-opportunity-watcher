@@ -62,6 +62,38 @@ class DeadlinePruningTests(unittest.TestCase):
 
         self.assertFalse(notice_is_registration_expired(notice, date(2026, 9, 8)))
 
+    def test_publish_date_near_registration_word_is_not_a_deadline(self):
+        notice = {
+            "title": "2026年9月1日 关于报名参加人工智能竞赛的通知",
+            "date": "2026-09-01",
+        }
+
+        self.assertIsNone(extract_registration_deadline(notice, date(2026, 9, 8)))
+
+    def test_explicit_deadline_after_date_is_detected(self):
+        notice = {"detail_text": "请于2026年9月10日前提交报名表。"}
+
+        self.assertEqual(
+            extract_registration_deadline(notice, date(2026, 9, 8)),
+            date(2026, 9, 10),
+        )
+
+    def test_full_year_registration_range_uses_end_date(self):
+        notice = {"detail_text": "报名时间：2026年9月1日至2026年10月10日。"}
+
+        self.assertEqual(
+            extract_registration_deadline(notice, date(2026, 9, 8)),
+            date(2026, 10, 10),
+        )
+
+    def test_yearless_range_uses_notice_year(self):
+        notice = {"date": "2025-08-20", "detail_text": "报名时间：9月1日至10日。"}
+
+        self.assertEqual(
+            extract_registration_deadline(notice, date(2026, 8, 25)),
+            date(2025, 9, 10),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
