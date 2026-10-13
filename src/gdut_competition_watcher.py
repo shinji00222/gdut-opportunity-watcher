@@ -48,6 +48,7 @@ SOURCES = [
     ("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛"),
     ("创新创业学院", "https://cxcy.gdut.edu.cn/", "竞赛"),
     ("集成电路学院竞赛通知", "https://sme.gdut.edu.cn/index/tzgg.htm", "竞赛"),
+    ("经济学院竞赛通知", "https://jjxy.gdut.edu.cn/", "竞赛"),
     (GDUT_COLLECTION_SOURCE, GDUT_COLLECTION_URL, "竞赛"),
     ("广东省工科大学生实验综合技能竞赛", "https://jnds.gdut.edu.cn/", "竞赛"),
     ("工程训练中心学科竞赛", "https://etc.gdut.edu.cn/index/xkjs.htm", "竞赛"),
