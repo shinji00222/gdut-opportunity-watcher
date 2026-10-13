@@ -79,6 +79,11 @@ IGNORE_WORDS = (
     "教师教学创新大赛", "教职工", "体育比赛成绩", "创新创业教育",
     "竞赛场地", "就餐地点", "住宿信息",
 )
+NON_ACTIONABLE_COMPETITION_MARKERS = (
+    "成绩公示", "成绩公布", "获奖名单", "获奖结果", "获奖公示", "拟获奖",
+    "名单公示", "拟入驻名单", "喜获", "荣获", "获佳绩", "再捧", "夺冠",
+    "圆满落幕", "圆满结束", "赛事回顾",
+)
 
 
 @dataclass
@@ -284,6 +289,8 @@ def extract_career_competition_notices(html: str, base_url: str) -> list[Notice]
         raise ValueError("页面中没有可解析的赛事卡片，可能网站结构已变化")
     notices = []
     for card in parser.cards:
+        if any(marker in card["title"] for marker in NON_ACTIONABLE_COMPETITION_MARKERS):
+            continue
         detail = "\n".join(card["paragraphs"])
         url = urllib.parse.urljoin(base_url, f"/competition/view/competition_id/{card['id']}")
         notice_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
@@ -833,6 +840,8 @@ def notice_is_stale_competition(notice: dict, today: date | None = None) -> bool
     if notice.get("category") != "竞赛":
         return False
     title = str(notice.get("title", ""))
+    if any(marker in title for marker in NON_ACTIONABLE_COMPETITION_MARKERS):
+        return True
     year = re.search(r"(?<!\d)(20\d{2})(?!\d)", title)
     return bool(year and int(year.group(1)) < today.year - 1)
 
