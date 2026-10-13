@@ -14,7 +14,7 @@ import urllib.request
 import webbrowser
 import ctypes
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 import tkinter as tk
@@ -27,6 +27,7 @@ STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "watcher.log"
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
+DETAIL_REFRESH_INTERVAL = timedelta(days=7)
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -85,6 +86,7 @@ class Notice:
     detail_text: str = ""
     hard_conditions: list[str] = field(default_factory=list)
     lifecycle_stage: str = ""
+    detail_checked_at: str = ""
 
 
 class LinkParser(HTMLParser):
@@ -404,7 +406,10 @@ def load_state() -> dict:
         for key, value in profile.items():
             profile[key] = "" if value is None else str(value)
         for notice in state.get("notices", []):
-            for key in ("date", "first_seen", "summary", "detail_text", "category", "lifecycle_stage"):
+            for key in (
+                "date", "first_seen", "summary", "detail_text", "category",
+                "lifecycle_stage", "detail_checked_at",
+            ):
                 if key in notice and not isinstance(notice[key], str):
                     notice[key] = str(notice[key] or "")
             hard_conditions = notice.get("hard_conditions", [])
@@ -476,7 +481,8 @@ def _deadline_context_is_relevant(text: str, start: int, end: int) -> bool:
     prefix = text[max(0, start - 36):start]
     suffix = text[end:min(len(text), end + 18)]
     explicit_deadline_before = re.search(
-        r"(?:报名|申报|申请|提交|材料)?(?:截止|截至)(?:时间|日期)?\s*(?:为|是|：|:|到)?\s*$",
+        r"(?:报名|申报|申请|提交|材料)?(?:截止|截至)(?:时间|日期)?\s*"
+        r"(?:(?:已)?(?:调整|变更|延期|延长)(?:为|至|到)?|为|是|：|:|到)?\s*$",
         prefix,
     )
     explicit_deadline_after = re.match(
@@ -582,6 +588,36 @@ def notice_is_registration_expired(notice: dict, today: date | None = None) -> b
     return bool(deadline and deadline < today)
 
 
+def detail_refresh_due(last_checked_at: str, now: datetime | None = None) -> bool:
+    if not last_checked_at:
+        return True
+    try:
+        checked_at = datetime.strptime(last_checked_at, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return True
+    now = now or datetime.now()
+    return now - checked_at >= DETAIL_REFRESH_INTERVAL
+
+
+def recently_expired_notice_ids(state: dict, notices: list[Notice], today: date | None = None) -> set[str]:
+    today = today or date.today()
+    cache = state.get("expired_checked_at", {})
+    if not isinstance(cache, dict):
+        return set()
+    suppressed = set()
+    for notice in notices:
+        entry = cache.get(notice.id)
+        if not isinstance(entry, dict) or detail_refresh_due(entry.get("checked_at", "")):
+            continue
+        if entry.get("title") and entry["title"] != notice.title:
+            continue
+        deadline = extract_registration_deadline(asdict(notice), today)
+        if deadline and deadline >= today:
+            continue
+        suppressed.add(notice.id)
+    return suppressed
+
+
 def notice_is_stale_competition(notice: dict, today: date | None = None) -> bool:
     today = today or date.today()
     if notice.get("category") != "竞赛":
@@ -615,6 +651,26 @@ def prune_expired_notices(state: dict, today: date | None = None) -> list[str]:
         state["notices"] = kept
         state["favorites"] = [item for item in state.get("favorites", []) if item not in removed_ids]
         state["expired_removed"] = sorted(removed_ids)
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cache = state.get("expired_checked_at", {})
+        if not isinstance(cache, dict):
+            cache = {}
+        cache = {
+            notice_id: entry
+            for notice_id, entry in cache.items()
+            if isinstance(notice_id, str) and isinstance(entry, dict)
+        }
+        removed_by_id = {notice.get("id"): notice for notice in notices if notice.get("id") in removed_ids}
+        for notice_id in removed_ids:
+            removed = removed_by_id[notice_id]
+            cache[notice_id] = {
+                "checked_at": removed.get("detail_checked_at") or checked_at,
+                "title": str(removed.get("title", "")),
+            }
+        if len(cache) > 500:
+            cache = dict(sorted(cache.items(), key=lambda item: str(item[1].get("checked_at", "")))[-500:])
+        state["expired_checked_at"] = cache
+        state["seen"] = [item for item in state.get("seen", []) if item not in removed_ids]
     return sorted(item for item in removed_ids if item)
 
 
@@ -802,20 +858,41 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
     seen = set(state.get("seen", []))
     first_run = not state.get("initialized", False) or state.get("schema_version", 1) < 2
     old_by_id = {n["id"]: n for n in state.get("notices", [])}
+    expired_cache = state.get("expired_checked_at", {})
+    if not isinstance(expired_cache, dict):
+        expired_cache = {}
+    legacy_expired = state.get("expired_removed", [])
+    if isinstance(legacy_expired, list):
+        titles_by_id = {n.id: n.title for n in current}
+        last_check = state.get("last_check", "")
+        for notice_id in legacy_expired:
+            if isinstance(notice_id, str) and notice_id not in expired_cache:
+                expired_cache[notice_id] = {
+                    "checked_at": last_check if isinstance(last_check, str) else "",
+                    "title": titles_by_id.get(notice_id, ""),
+                }
+    state["expired_removed"] = []
+    state["expired_checked_at"] = expired_cache
+    expired_recently = recently_expired_notice_ids(state, current)
+    current = [n for n in current if n.id not in expired_recently]
     for n in current:
         old = old_by_id.get(n.id, {})
         n.first_seen = old.get("first_seen", now)
         if n.source != "蓝桥杯大赛官网":
-            n.summary = old.get("summary", "")
-            n.detail_text = old.get("detail_text", "")
-            n.hard_conditions = old.get("hard_conditions", [])
-    # 先用列表页已有的截止信息过滤，减少过期竞赛详情页请求；未知截止日仍读取正文。
-    current = [n for n in current if not notice_is_registration_expired(asdict(n))]
-    # 新通知和尚未采集过正文的旧通知才读取详情，每轮最多30条。
-    detail_targets = [n for n in current if not n.detail_text or not n.hard_conditions][:30]
+            n.summary = n.summary or old.get("summary", "")
+            n.detail_text = old.get("detail_text") or n.detail_text
+            n.hard_conditions = old.get("hard_conditions") or n.hard_conditions
+            n.detail_checked_at = old.get("detail_checked_at") or old.get("first_seen", "")
+    # 先刷新详情已过期的项目，再按截止日清理，避免延期后仍按旧日期删除。
+    detail_targets = [
+        n for n in current
+        if n.source != "蓝桥杯大赛官网"
+        and (not n.detail_text or not n.hard_conditions or detail_refresh_due(n.detail_checked_at))
+    ][:30]
     def load_detail(n: Notice):
         try:
             n.summary, n.detail_text, n.hard_conditions = extract_detail_data(fetch(n.url), n.title)
+            n.detail_checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         except Exception as exc:
             n.summary = "详情暂时无法读取，请打开学校原通知查看。"
             n.hard_conditions = ["原通知详情暂时无法读取，硬性条件尚未完成采集；请打开来源链接人工核对。"]
@@ -825,10 +902,52 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
     if detail_targets:
         with ThreadPoolExecutor(max_workers=min(6, len(detail_targets))) as pool:
             list(pool.map(load_detail, detail_targets))
-    current = [n for n in current if not notice_is_registration_expired(asdict(n))]
+    expired_current = [n for n in current if notice_is_registration_expired(asdict(n))]
+    expired_current_ids = {n.id for n in expired_current}
+    for n in expired_current:
+        old_by_id[n.id] = asdict(n)
+    current = [n for n in current if n.id not in expired_current_ids]
+    retired_without_reopen = set()
+    for n in current:
+        entry = expired_cache.get(n.id)
+        if not isinstance(entry, dict):
+            continue
+        old_title = entry.get("title", "")
+        title_changed = bool(old_title and old_title != n.title)
+        deadline = extract_registration_deadline(asdict(n))
+        if not title_changed and deadline is None:
+            retired_without_reopen.add(n.id)
+            expired_cache[n.id] = {
+                "checked_at": n.detail_checked_at or now,
+                "title": n.title or old_title,
+            }
+    reopened_ids = {
+        n.id for n in current
+        if isinstance(expired_cache.get(n.id), dict)
+        and n.id not in retired_without_reopen
+        and (
+            bool(expired_cache[n.id].get("title") and expired_cache[n.id]["title"] != n.title)
+            or extract_registration_deadline(asdict(n)) is not None
+        )
+    }
+    current = [n for n in current if n.id not in retired_without_reopen]
+    revised_ids = set()
+    for n in current:
+        old = old_by_id.get(n.id)
+        if not old:
+            continue
+        title_changed = bool(old.get("title") and old["title"] != n.title)
+        old_deadline = extract_registration_deadline(old)
+        new_deadline = extract_registration_deadline(asdict(n))
+        deadline_changed = old_deadline != new_deadline and (old_deadline is not None or new_deadline is not None)
+        if title_changed or deadline_changed:
+            revised_ids.add(n.id)
+
     new_items = [
         n for n in current
         if n.id not in seen
+        or n.id in revised_ids
+        or n.id in reopened_ids
         or (
             n.source == "蓝桥杯大赛官网"
             and n.lifecycle_stage == "open"
@@ -852,6 +971,9 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
         latest_state = load_state()
         state["profile"] = latest_state.get("profile", state.get("profile", {}))
         state["favorites"] = latest_state.get("favorites", state.get("favorites", []))
+        for notice_id in reopened_ids:
+            expired_cache.pop(notice_id, None)
+        state["expired_checked_at"] = expired_cache
         removed_irrelevant = prune_irrelevant_notices(state)
         removed_expired = prune_expired_notices(state)
         _write_state_atomic(state)

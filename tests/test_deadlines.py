@@ -1,10 +1,12 @@
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from src.gdut_competition_watcher import (
+    Notice,
     extract_registration_deadline,
     notice_is_registration_expired,
     prune_expired_notices,
+    recently_expired_notice_ids,
 )
 
 
@@ -46,6 +48,7 @@ class DeadlinePruningTests(unittest.TestCase):
                 {"id": "fresh", "title": "竞赛报名截止时间为2026年9月9日"},
             ],
             "favorites": ["old", "fresh"],
+            "seen": ["old", "fresh"],
         }
 
         removed = prune_expired_notices(state, date(2026, 9, 8))
@@ -53,6 +56,8 @@ class DeadlinePruningTests(unittest.TestCase):
         self.assertEqual(removed, ["old"])
         self.assertEqual([notice["id"] for notice in state["notices"]], ["fresh"])
         self.assertEqual(state["favorites"], ["fresh"])
+        self.assertEqual(state["seen"], ["fresh"])
+        self.assertIn("old", state["expired_checked_at"])
 
     def test_plain_publish_date_without_deadline_context_is_not_removed(self):
         notice = {
@@ -78,6 +83,14 @@ class DeadlinePruningTests(unittest.TestCase):
             date(2026, 9, 10),
         )
 
+    def test_adjusted_registration_deadline_is_detected(self):
+        notice = {"detail_text": "报名截止时间调整为2026年9月20日，请按时提交材料。"}
+
+        self.assertEqual(
+            extract_registration_deadline(notice, date(2026, 9, 8)),
+            date(2026, 9, 20),
+        )
+
     def test_full_year_registration_range_uses_end_date(self):
         notice = {"detail_text": "报名时间：2026年9月1日至2026年10月10日。"}
 
@@ -101,6 +114,39 @@ class DeadlinePruningTests(unittest.TestCase):
             extract_registration_deadline(notice, date(2026, 11, 20)),
             date(2027, 1, 10),
         )
+
+    def test_recently_expired_notice_waits_a_week_before_retrying(self):
+        notice = Notice(
+            id="expired-item",
+            title="2026年创新竞赛报名通知",
+            url="https://example.com/event",
+            source="测试来源",
+        )
+        state = {
+            "expired_checked_at": {
+                notice.id: {
+                    "checked_at": (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "title": notice.title,
+                }
+            }
+        }
+
+        self.assertEqual(recently_expired_notice_ids(state, [notice]), {notice.id})
+        state["expired_checked_at"][notice.id]["checked_at"] = (
+            datetime.now() - timedelta(days=8)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(recently_expired_notice_ids(state, [notice]), set())
+
+        state["expired_checked_at"][notice.id]["checked_at"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        changed_title = Notice(
+            id=notice.id,
+            title="2026年创新竞赛报名时间调整",
+            url=notice.url,
+            source=notice.source,
+        )
+        self.assertEqual(recently_expired_notice_ids(state, [changed_title]), set())
 
 
 if __name__ == "__main__":

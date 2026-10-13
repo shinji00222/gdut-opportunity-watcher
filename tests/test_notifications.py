@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -47,13 +47,16 @@ class LanqiaoRegistrationNotificationTests(unittest.TestCase):
                 patch.object(watcher, "STATE_FILE", state_file),
                 patch.object(watcher, "LOG_FILE", log_file),
                 patch.object(watcher, "check_all", return_value=([opened], [])),
+                patch.object(watcher, "fetch") as fetch,
                 patch.object(watcher, "notify_windows") as notify,
             ):
                 new_items, errors, first_run = watcher.run_check()
+                saved_state = watcher.load_state()
                 self.assertFalse(errors)
                 self.assertFalse(first_run)
                 self.assertEqual([item.lifecycle_stage for item in new_items], ["open"])
                 notify.assert_called_once()
+                fetch.assert_not_called()
 
                 new_items, _, _ = watcher.run_check()
                 self.assertEqual(new_items, [])
@@ -61,6 +64,154 @@ class LanqiaoRegistrationNotificationTests(unittest.TestCase):
 
 
 class CheckCoordinationTests(unittest.TestCase):
+    def test_seen_notice_deadline_change_is_refreshed_and_notified_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            notice_id = "stable-url-id"
+            checked_at = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            old_notice = watcher.Notice(
+                id=notice_id,
+                title="校内创新竞赛报名通知",
+                url="https://example.com/event",
+                source="测试来源",
+                category="竞赛",
+                summary="报名截止时间为2026年10月12日。",
+                detail_text="报名截止时间为2026年10月12日，请按通知要求提交参赛材料。",
+                hard_conditions=["本科生可报名"],
+                detail_checked_at=checked_at,
+            )
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [notice_id],
+                "notices": [asdict(old_notice)],
+                "favorites": [],
+                "profile": {},
+            }), encoding="utf-8")
+            current_notice = watcher.Notice(
+                id=notice_id,
+                title=old_notice.title,
+                url=old_notice.url,
+                source=old_notice.source,
+                category=old_notice.category,
+            )
+            revised_html = (
+                "<html><body><p>报名截止时间调整为2026年10月20日，"
+                "请参赛队按新时间提交报名表和相关材料。</p></body></html>"
+            )
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", return_value=([current_notice], [])),
+                patch.object(watcher, "fetch", return_value=revised_html) as fetch,
+                patch.object(watcher, "notify_windows") as notify,
+            ):
+                new_items, errors, first_run = watcher.run_check()
+                self.assertEqual(errors, [])
+                self.assertFalse(first_run)
+                self.assertEqual([item.id for item in new_items], [notice_id])
+                self.assertEqual(notify.call_count, 1)
+                saved_notice = watcher.load_state()["notices"][0]
+                self.assertIn("10月20日", saved_notice["detail_text"])
+
+                new_items, _, _ = watcher.run_check()
+                self.assertEqual(new_items, [])
+                self.assertEqual(fetch.call_count, 1)
+                notify.assert_called_once()
+
+    def test_expired_notice_is_refreshed_weekly_without_daily_repeat_fetches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            notice_id = "expired-stable-url"
+            checked_at = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [],
+                "notices": [],
+                "favorites": [],
+                "profile": {},
+                "expired_checked_at": {
+                    notice_id: {"checked_at": checked_at, "title": "旧竞赛报名通知"}
+                },
+            }), encoding="utf-8")
+            notice = watcher.Notice(
+                id=notice_id,
+                title="旧竞赛报名通知",
+                url="https://example.com/expired",
+                source="测试来源",
+            )
+            yesterday = date.today() - timedelta(days=1)
+            deadline = f"{yesterday.year}年{yesterday.month}月{yesterday.day}日"
+            expired_html = (
+                f"<html><body><p>报名截止时间为{deadline}，"
+                "请参赛队按通知要求提交报名表和相关材料。</p></body></html>"
+            )
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", return_value=([notice], [])),
+                patch.object(watcher, "fetch", return_value=expired_html) as fetch,
+            ):
+                watcher.run_check(notify=False)
+                state = watcher.load_state()
+                self.assertEqual(state["notices"], [])
+                self.assertIn(notice_id, state["expired_checked_at"])
+                watcher.run_check(notify=False)
+                fetch.assert_called_once()
+
+    def test_legacy_expired_notice_with_extended_deadline_reopens_and_notifies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            notice_id = "legacy-expired-url"
+            last_check = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [notice_id],
+                "notices": [],
+                "favorites": [],
+                "profile": {},
+                "expired_removed": [notice_id],
+                "last_check": last_check,
+            }), encoding="utf-8")
+            notice = watcher.Notice(
+                id=notice_id,
+                title="2026年创新竞赛报名通知",
+                url="https://example.com/reopened",
+                source="测试来源",
+            )
+            future = date.today() + timedelta(days=7)
+            deadline = f"{future.year}年{future.month}月{future.day}日"
+            revised_html = (
+                f"<html><body><p>报名截止时间调整为{deadline}，"
+                "请参赛队按新时间提交报名表和相关材料。</p></body></html>"
+            )
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", return_value=([notice], [])),
+                patch.object(watcher, "fetch", return_value=revised_html),
+                patch.object(watcher, "notify_windows") as notify,
+            ):
+                new_items, errors, first_run = watcher.run_check()
+                saved_state = watcher.load_state()
+
+            self.assertEqual(errors, [])
+            self.assertFalse(first_run)
+            self.assertEqual([item.id for item in new_items], [notice_id])
+            self.assertEqual(notify.call_count, 1)
+            self.assertNotIn(notice_id, saved_state.get("expired_checked_at", {}))
+
     def test_check_mutex_allows_one_run_and_skips_overlap(self):
         with watcher._check_mutex() as first:
             self.assertTrue(first)
