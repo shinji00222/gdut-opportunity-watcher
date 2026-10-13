@@ -283,6 +283,22 @@ class SourceHealthTests(unittest.TestCase):
             "https://etc.gdut.edu.cn/info/1034/2115.htm",
         )
 
+    def test_truncated_engineering_competition_titles_are_not_filtered_out(self):
+        html = (
+            '<a href="/info/1023/1283.htm">关于举办2026年广东省工科大学生实验综...</a>'
+            '<a href="/info/1023/1293.htm">2026年广东省工科大学生综合实验技能竞...</a>'
+        )
+
+        notices = watcher.extract_notices(
+            "广东省工科大学生实验综合技能竞赛",
+            "https://jnds.gdut.edu.cn/",
+            html,
+            "竞赛",
+        )
+
+        self.assertEqual(len(notices), 2)
+        self.assertTrue(all(notice.category == "竞赛" for notice in notices))
+
     def test_verification_page_is_reported_as_a_fetch_failure(self):
         response = BytesIO("<html>请完成人机验证后继续</html>".encode("utf-8"))
         response.headers = Message()
