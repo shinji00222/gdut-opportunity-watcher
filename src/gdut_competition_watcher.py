@@ -83,7 +83,7 @@ CATEGORY_KEYWORDS = {
 KEYWORDS = tuple(dict.fromkeys(k for values in CATEGORY_KEYWORDS.values() for k in values))
 IGNORE_WORDS = (
     "教师教学创新大赛", "教职工", "体育比赛成绩", "创新创业教育",
-    "竞赛场地", "就餐地点", "住宿信息",
+    "竞赛场地", "就餐地点", "住宿信息", "学位留学项目", "选拔名单公示",
 )
 NON_ACTIONABLE_COMPETITION_MARKERS = (
     "成绩公示", "成绩公布", "获奖名单", "获奖结果", "获奖公示", "拟获奖",
@@ -874,6 +874,19 @@ def notice_is_stale_competition(notice: dict, today: date | None = None) -> bool
     return bool(years and max(years) < today.year)
 
 
+def notice_is_stale_abroad(notice: dict, today: date | None = None) -> bool:
+    today = today or date.today()
+    if notice.get("category") != "出国":
+        return False
+    years = [int(value) for value in re.findall(r"(?<!\d)(20\d{2})(?!\d)", str(notice.get("title", "")))]
+    if not years:
+        return False
+    latest_year = max(years)
+    if latest_year < today.year:
+        return True
+    return latest_year == today.year and today.month >= 9 and "暑期" in str(notice.get("title", ""))
+
+
 def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str]:
     today = today or date.today()
     notices = state.get("notices", [])
@@ -881,6 +894,7 @@ def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str
         notice for notice in notices
         if not any(word in str(notice.get("title", "")) for word in IGNORE_WORDS)
         and not notice_is_stale_competition(notice, today)
+        and not notice_is_stale_abroad(notice, today)
     ]
     removed_ids = {notice.get("id") for notice in notices} - {notice.get("id") for notice in kept}
     if removed_ids:
@@ -975,7 +989,8 @@ def extract_notices(
             continue
         if any(k in title for k in IGNORE_WORDS):
             continue
-        if notice_is_stale_competition({"category": category, "title": title}, today):
+        notice_data = {"category": category, "title": title}
+        if notice_is_stale_competition(notice_data, today) or notice_is_stale_abroad(notice_data, today):
             continue
         url = urllib.parse.urljoin(base_url, href)
         if not url.startswith(("http://", "https://")):
