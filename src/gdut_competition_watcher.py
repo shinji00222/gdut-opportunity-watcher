@@ -30,6 +30,7 @@ MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
 DETAIL_REFRESH_INTERVAL = timedelta(days=7)
 DETAIL_RETRY_INTERVAL = timedelta(days=1)
+INTERNSHIP_MAX_AGE = timedelta(days=60)
 MAX_DETAIL_TARGETS = 30
 INTERNATIONAL_INTERNSHIP_SOURCE = "国际组织实习平台"
 INTERNATIONAL_INTERNSHIP_URL = "https://gj.ncss.cn/job.html"
@@ -77,7 +78,7 @@ CATEGORY_KEYWORDS = {
         "国际暑期项目", "海外暑期项目", "短期海外游学",
     ),
     "实习": (
-        "实习", "实习生", "暑期实习", "寒假实习", "实践项目", "训练营",
+        "实习", "实习生", "暑期实习", "寒假实习", "实践项目",
     ),
 }
 KEYWORDS = tuple(dict.fromkeys(k for values in CATEGORY_KEYWORDS.values() for k in values))
@@ -887,6 +888,23 @@ def notice_is_stale_abroad(notice: dict, today: date | None = None) -> bool:
     return latest_year == today.year and today.month >= 9 and "暑期" in str(notice.get("title", ""))
 
 
+def notice_is_stale_internship(notice: dict, today: date | None = None) -> bool:
+    today = today or date.today()
+    if notice.get("category") != "实习":
+        return False
+    title = str(notice.get("title", ""))
+    if "训练营" in title and not any(word in title for word in ("实习", "实习生", "实践项目")):
+        return True
+    published = str(notice.get("date", ""))[:10]
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", published):
+        published = str(notice.get("first_seen", ""))[:10]
+    try:
+        published_at = date.fromisoformat(published)
+    except ValueError:
+        return False
+    return today - published_at > INTERNSHIP_MAX_AGE
+
+
 def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str]:
     today = today or date.today()
     notices = state.get("notices", [])
@@ -895,6 +913,7 @@ def prune_irrelevant_notices(state: dict, today: date | None = None) -> list[str
         if not any(word in str(notice.get("title", "")) for word in IGNORE_WORDS)
         and not notice_is_stale_competition(notice, today)
         and not notice_is_stale_abroad(notice, today)
+        and not notice_is_stale_internship(notice, today)
     ]
     removed_ids = {notice.get("id") for notice in notices} - {notice.get("id") for notice in kept}
     if removed_ids:
