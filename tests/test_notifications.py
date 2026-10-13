@@ -122,6 +122,56 @@ class CheckCoordinationTests(unittest.TestCase):
                 self.assertEqual(fetch.call_count, 1)
                 notify.assert_called_once()
 
+    def test_failed_detail_refresh_preserves_saved_content_and_retries_next_day(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            notice_id = "detail-refresh-failure"
+            checked_at = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            old_notice = watcher.Notice(
+                id=notice_id,
+                title="校内创新竞赛报名通知",
+                url="https://example.com/event",
+                source="测试来源",
+                category="竞赛",
+                summary="原摘要：本科生组报名截止时间尚未变化。",
+                detail_text="原正文内容：竞赛面向本科生开放报名，截止日期以学校通知为准。",
+                hard_conditions=["原参赛条件：本科生可报名。"],
+                detail_checked_at=checked_at,
+            )
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "seen": [notice_id],
+                "notices": [asdict(old_notice)],
+                "favorites": [],
+                "profile": {},
+            }), encoding="utf-8")
+            current_notice = watcher.Notice(
+                id=notice_id,
+                title=old_notice.title,
+                url=old_notice.url,
+                source=old_notice.source,
+                category=old_notice.category,
+            )
+
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+                patch.object(watcher, "check_all", return_value=([current_notice], [])),
+                patch.object(watcher, "fetch", side_effect=OSError("offline")) as fetch,
+            ):
+                watcher.run_check(notify=False)
+                saved = watcher.load_state()["notices"][0]
+                self.assertEqual(saved["summary"], old_notice.summary)
+                self.assertEqual(saved["detail_text"], old_notice.detail_text)
+                self.assertEqual(saved["hard_conditions"], old_notice.hard_conditions)
+                self.assertTrue(saved["detail_attempted_at"])
+
+                watcher.run_check(notify=False)
+                fetch.assert_called_once()
+
     def test_expired_notice_is_refreshed_weekly_without_daily_repeat_fetches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)

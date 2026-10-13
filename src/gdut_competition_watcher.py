@@ -28,6 +28,7 @@ LOG_FILE = APP_DIR / "watcher.log"
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
 DETAIL_REFRESH_INTERVAL = timedelta(days=7)
+DETAIL_RETRY_INTERVAL = timedelta(days=1)
 CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
 _THREAD_CHECK_LOCK = threading.Lock()
 _THREAD_STATE_LOCK = threading.Lock()
@@ -87,6 +88,7 @@ class Notice:
     hard_conditions: list[str] = field(default_factory=list)
     lifecycle_stage: str = ""
     detail_checked_at: str = ""
+    detail_attempted_at: str = ""
 
 
 class LinkParser(HTMLParser):
@@ -408,7 +410,7 @@ def load_state() -> dict:
         for notice in state.get("notices", []):
             for key in (
                 "date", "first_seen", "summary", "detail_text", "category",
-                "lifecycle_stage", "detail_checked_at",
+                "lifecycle_stage", "detail_checked_at", "detail_attempted_at",
             ):
                 if key in notice and not isinstance(notice[key], str):
                     notice[key] = str(notice[key] or "")
@@ -588,14 +590,25 @@ def notice_is_registration_expired(notice: dict, today: date | None = None) -> b
     return bool(deadline and deadline < today)
 
 
-def detail_refresh_due(last_checked_at: str, now: datetime | None = None) -> bool:
+def detail_refresh_due(
+    last_checked_at: str,
+    last_attempted_at: str = "",
+    now: datetime | None = None,
+) -> bool:
+    now = now or datetime.now()
+    if last_attempted_at:
+        try:
+            attempted_at = datetime.strptime(last_attempted_at, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            attempted_at = None
+        if attempted_at and now - attempted_at < DETAIL_RETRY_INTERVAL:
+            return False
     if not last_checked_at:
         return True
     try:
         checked_at = datetime.strptime(last_checked_at, "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return True
-    now = now or datetime.now()
     return now - checked_at >= DETAIL_REFRESH_INTERVAL
 
 
@@ -607,7 +620,9 @@ def recently_expired_notice_ids(state: dict, notices: list[Notice], today: date 
     suppressed = set()
     for notice in notices:
         entry = cache.get(notice.id)
-        if not isinstance(entry, dict) or detail_refresh_due(entry.get("checked_at", "")):
+        if not isinstance(entry, dict) or detail_refresh_due(
+            entry.get("checked_at", ""), entry.get("attempted_at", "")
+        ):
             continue
         if entry.get("title") and entry["title"] != notice.title:
             continue
@@ -665,6 +680,7 @@ def prune_expired_notices(state: dict, today: date | None = None) -> list[str]:
             removed = removed_by_id[notice_id]
             cache[notice_id] = {
                 "checked_at": removed.get("detail_checked_at") or checked_at,
+                "attempted_at": removed.get("detail_attempted_at") or removed.get("detail_checked_at") or checked_at,
                 "title": str(removed.get("title", "")),
             }
         if len(cache) > 500:
@@ -869,6 +885,7 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
             if isinstance(notice_id, str) and notice_id not in expired_cache:
                 expired_cache[notice_id] = {
                     "checked_at": last_check if isinstance(last_check, str) else "",
+                    "attempted_at": last_check if isinstance(last_check, str) else "",
                     "title": titles_by_id.get(notice_id, ""),
                 }
     state["expired_removed"] = []
@@ -883,20 +900,28 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
             n.detail_text = old.get("detail_text") or n.detail_text
             n.hard_conditions = old.get("hard_conditions") or n.hard_conditions
             n.detail_checked_at = old.get("detail_checked_at") or old.get("first_seen", "")
+            n.detail_attempted_at = old.get("detail_attempted_at", "")
     # 先刷新详情已过期的项目，再按截止日清理，避免延期后仍按旧日期删除。
     detail_targets = [
         n for n in current
         if n.source != "蓝桥杯大赛官网"
-        and (not n.detail_text or not n.hard_conditions or detail_refresh_due(n.detail_checked_at))
+        and (
+            ((not n.detail_text or not n.hard_conditions) and detail_refresh_due("", n.detail_attempted_at))
+            or detail_refresh_due(n.detail_checked_at, n.detail_attempted_at)
+        )
     ][:30]
     def load_detail(n: Notice):
         try:
             n.summary, n.detail_text, n.hard_conditions = extract_detail_data(fetch(n.url), n.title)
             n.detail_checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         except Exception as exc:
-            n.summary = "详情暂时无法读取，请打开学校原通知查看。"
-            n.hard_conditions = ["原通知详情暂时无法读取，硬性条件尚未完成采集；请打开来源链接人工核对。"]
+            n.summary = n.summary or "详情暂时无法读取，请打开学校原通知查看。"
+            n.hard_conditions = n.hard_conditions or [
+                "原通知详情暂时无法读取，硬性条件尚未完成采集；请打开来源链接人工核对。"
+            ]
             log(f"简介提取失败 {n.url}: {exc!r}")
+        finally:
+            n.detail_attempted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return n
 
     if detail_targets:
@@ -919,6 +944,7 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
             retired_without_reopen.add(n.id)
             expired_cache[n.id] = {
                 "checked_at": n.detail_checked_at or now,
+                "attempted_at": n.detail_attempted_at or entry.get("attempted_at") or now,
                 "title": n.title or old_title,
             }
     reopened_ids = {
