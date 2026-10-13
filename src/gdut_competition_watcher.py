@@ -514,6 +514,27 @@ def extract_registration_deadline(notice: dict, today: date | None = None) -> da
         if parsed:
             deadlines.append(parsed)
             covered_ranges.append(match.span())
+    cross_month_range_pattern = re.compile(
+        r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?\s*"
+        r"(?:至|到|[-~～—])\s*(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?"
+    )
+    for match in cross_month_range_pattern.finditer(text):
+        if not _registration_range_context(text, match.start()):
+            continue
+        if any(start <= match.start() < end for start, end in covered_ranges):
+            continue
+        start_year = int(match.group(1) or reference_year)
+        start_month = int(match.group(2))
+        end_year = int(match.group(4) or start_year)
+        end_month = int(match.group(5))
+        if start_month == end_month:
+            continue  # The same-month parser below handles this form.
+        if not match.group(4) and end_month < start_month:
+            end_year += 1
+        parsed = _safe_date(end_year, end_month, int(match.group(6)))
+        if parsed:
+            deadlines.append(parsed)
+            covered_ranges.append(match.span())
     range_same_month_pattern = re.compile(
         r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?\s*"
         r"(?:至|到|[-~～—])\s*(?!20\d{2})(\d{1,2})\s*(?:日|号)?"

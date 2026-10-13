@@ -94,6 +94,14 @@ class DeadlinePruningTests(unittest.TestCase):
             date(2025, 9, 10),
         )
 
+    def test_cross_year_month_range_rolls_end_date_into_next_year(self):
+        notice = {"date": "2026-11-20", "detail_text": "报名时间：12月20日至1月10日。"}
+
+        self.assertEqual(
+            extract_registration_deadline(notice, date(2026, 11, 20)),
+            date(2027, 1, 10),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
