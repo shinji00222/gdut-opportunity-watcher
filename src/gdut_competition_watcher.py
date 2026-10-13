@@ -1049,6 +1049,25 @@ def check_all() -> tuple[list[Notice], list[str]]:
                     except Exception as exc:
                         page_errors.append(f"分页读取失败：{exc}")
                 return source, items, "；".join(page_errors)
+            if source == "学生工作处":
+                items = extract_notices(source, url, html, source_default)
+                parser = LinkParser()
+                parser.feed(html)
+                page_urls = []
+                page_errors = []
+                for href, _title in parser.links:
+                    if not re.search(r"(?:^|/)tzgg/\d+\.htm(?:$|[?#])", href):
+                        continue
+                    page_url = urllib.parse.urljoin(url, href)
+                    parsed_url = urllib.parse.urlparse(page_url)
+                    if parsed_url.netloc == "xsc.gdut.edu.cn" and page_url not in page_urls:
+                        page_urls.append(page_url)
+                for page_url in page_urls[:3]:
+                    try:
+                        items.extend(extract_notices(source, page_url, fetch(page_url), source_default))
+                    except Exception as exc:
+                        page_errors.append(f"分页读取失败：{exc}")
+                return source, items, "；".join(page_errors)
             else:
                 items = extract_notices(source, url, html, source_default)
             if source == "蓝桥杯大赛官网":
