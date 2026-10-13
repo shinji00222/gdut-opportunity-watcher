@@ -312,6 +312,11 @@ def load_state() -> dict:
         valid_state = valid_state and isinstance(state.get("profile", {}), dict)
         valid_state = valid_state and isinstance(state.get("seen", []), list)
         valid_state = valid_state and isinstance(state.get("favorites", []), list)
+        valid_state = valid_state and (
+            "schema_version" not in state
+            or (isinstance(state["schema_version"], int) and not isinstance(state["schema_version"], bool))
+        )
+        valid_state = valid_state and ("initialized" not in state or isinstance(state["initialized"], bool))
         if valid_state:
             valid_state = all(isinstance(item, str) for item in state.get("seen", []))
             valid_state = valid_state and all(isinstance(item, str) for item in state.get("favorites", []))
@@ -332,8 +337,10 @@ def load_state() -> dict:
             for key in ("date", "first_seen", "summary", "detail_text", "category", "lifecycle_stage"):
                 if key in notice and not isinstance(notice[key], str):
                     notice[key] = str(notice[key] or "")
-            if not isinstance(notice.get("hard_conditions", []), list):
-                notice["hard_conditions"] = []
+            hard_conditions = notice.get("hard_conditions", [])
+            if not isinstance(hard_conditions, list):
+                hard_conditions = []
+            notice["hard_conditions"] = [item for item in hard_conditions if isinstance(item, str)]
             if notice.get("category") == "出国交流":
                 notice["category"] = "出国"
             if not notice.get("hard_conditions"):
@@ -348,7 +355,7 @@ def load_state() -> dict:
         return state
     except FileNotFoundError:
         return _empty_state()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         _preserve_corrupt_state()
         return _empty_state()
 

@@ -96,6 +96,58 @@ class StateFileSafetyTests(unittest.TestCase):
                 self.assertEqual(len(backups), 1)
                 self.assertEqual(backups[0].read_text(encoding="utf-8"), '{"notices": [null]}')
 
+    def test_invalid_schema_version_is_preserved_before_reset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            malformed = '{"initialized": true, "schema_version": "two", "notices": []}'
+            state_file.write_text(malformed, encoding="utf-8")
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+            ):
+                self.assertFalse(watcher.load_state()["initialized"])
+                backups = list(app_dir.glob("state.corrupt-*.json"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_text(encoding="utf-8"), malformed)
+
+    def test_invalid_utf8_state_is_preserved_before_reset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            malformed = b'{"initialized": true, "title": "\xff"}'
+            state_file.write_bytes(malformed)
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+            ):
+                self.assertFalse(watcher.load_state()["initialized"])
+                backups = list(app_dir.glob("state.corrupt-*.json"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), malformed)
+
+    def test_non_text_hard_conditions_are_dropped_without_losing_notice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            state_file = app_dir / "state.json"
+            state_file.write_text(json.dumps({
+                "initialized": True,
+                "schema_version": 2,
+                "notices": [{
+                    "id": "notice-1", "title": "竞赛通知", "url": "https://example.com",
+                    "source": "测试来源", "hard_conditions": ["本科生可报名", {"bad": "value"}],
+                }],
+            }), encoding="utf-8")
+            with (
+                patch.object(watcher, "APP_DIR", app_dir),
+                patch.object(watcher, "STATE_FILE", state_file),
+                patch.object(watcher, "LOG_FILE", app_dir / "watcher.log"),
+            ):
+                notice = watcher.load_state()["notices"][0]
+            self.assertEqual(notice["hard_conditions"], ["本科生可报名"])
+
     def test_log_rotates_at_the_size_limit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
