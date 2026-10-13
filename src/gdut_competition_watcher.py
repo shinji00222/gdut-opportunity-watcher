@@ -988,6 +988,52 @@ def extract_notices(
     return list(found.values())
 
 
+def extract_jnds_featured_notices(
+    html: str,
+    base_url: str,
+    today: date | None = None,
+) -> list[Notice]:
+    """Read JNDS cards whose contest title is outside the generic detail link."""
+    today = today or date.today()
+    notices: dict[str, Notice] = {}
+    card_pattern = re.compile(
+        r'<h1\b[^>]*class=["\'][^"\']*\btext_c\b[^"\']*["\'][^>]*>(.*?)</h1>'
+        r'\s*<p\b[^>]*>(.*?)</p>',
+        re.I | re.S,
+    )
+    for match in card_pattern.finditer(html):
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", match.group(1))).strip()
+        title = html_lib.unescape(title)
+        category = classify(title, None)
+        if not category or any(word in title for word in IGNORE_WORDS):
+            continue
+        if notice_is_stale_competition({"category": category, "title": title}, today):
+            continue
+
+        details_parser = LinkParser()
+        details_parser.feed(match.group(2))
+        detail_href = next(
+            (href for href, label in details_parser.links if "查看详情" in label),
+            None,
+        )
+        if not detail_href:
+            continue
+        url = urllib.parse.urljoin(base_url, detail_href).split("#", 1)[0]
+        notice_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+        summary = re.sub(r"<[^>]+>", " ", match.group(2))
+        summary = html_lib.unescape(re.sub(r"\s+", " ", summary)).strip()
+        summary = re.sub(r"【?查看详情】?", "", summary).strip()
+        notices[notice_id] = Notice(
+            notice_id,
+            title,
+            url,
+            "广东省工科大学生实验综合技能竞赛",
+            summary=summary[:220],
+            category=category,
+        )
+    return list(notices.values())
+
+
 def fetch_gdut_collection_notices(today: date | None = None) -> list[Notice]:
     """Read active competition submissions from GDUT's public innovation platform."""
     today = today or date.today()
@@ -1219,6 +1265,8 @@ def check_all() -> tuple[list[Notice], list[str]]:
                 return source, items, "；".join(page_errors)
             else:
                 items = extract_notices(source, url, html, source_default)
+            if source == "广东省工科大学生实验综合技能竞赛":
+                items.extend(extract_jnds_featured_notices(html, url))
             if source == "蓝桥杯大赛官网":
                 registration_notice = extract_lanqiao_registration_notice(html)
                 if registration_notice:
