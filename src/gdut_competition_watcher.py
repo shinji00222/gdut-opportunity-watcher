@@ -103,6 +103,12 @@ class Notice:
     detail_attempted_at: str = ""
 
 
+class PartialSourceError(ValueError):
+    def __init__(self, notices: list[Notice], message: str):
+        self.notices = notices
+        super().__init__(message)
+
+
 class LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -362,6 +368,7 @@ def extract_international_internship_notices(payload: str) -> list[Notice]:
 def fetch_international_internship_notices() -> list[Notice]:
     endpoint = urllib.parse.urljoin(INTERNATIONAL_INTERNSHIP_URL, "/job/job.json")
     notices_by_id = {}
+    page_errors = []
     for page in (0, 1):
         params = urllib.parse.urlencode({
             "page": page,
@@ -374,10 +381,18 @@ def fetch_international_internship_notices() -> list[Notice]:
             "eduLevel": "",
             "area": "",
         })
-        notices = extract_international_internship_notices(fetch(f"{endpoint}?{params}"))
-        notices_by_id.update((notice.id, notice) for notice in notices)
+        try:
+            notices = extract_international_internship_notices(fetch(f"{endpoint}?{params}"))
+            notices_by_id.update((notice.id, notice) for notice in notices)
+        except Exception as exc:
+            page_errors.append(f"第 {page + 1} 页读取失败：{exc}")
     if not notices_by_id:
-        raise ValueError("国际组织实习平台未返回可解析岗位，可能接口或筛选结构已变化")
+        message = "国际组织实习平台未返回可解析岗位，可能接口或筛选结构已变化"
+        if page_errors:
+            message += "；" + "；".join(page_errors)
+        raise ValueError(message)
+    if page_errors:
+        raise PartialSourceError(list(notices_by_id.values()), "；".join(page_errors))
     return list(notices_by_id.values())
 
 
@@ -385,6 +400,7 @@ def fetch_national_internship_notices() -> list[Notice]:
     """Read a bounded set of active Guangdong internships from the official NCSS feed."""
     endpoint = "https://job.ncss.cn/student/jobs/jobslist/ajax/"
     notices_by_id: dict[str, Notice] = {}
+    page_errors = []
     for page in (1, 2, 3):
         params = urllib.parse.urlencode({
             "jobType": "03",
@@ -402,52 +418,55 @@ def fetch_national_internship_notices() -> list[Notice]:
             "sourcesName": "0",
             "sourcesType": "",
         })
-        request_url = f"{endpoint}?{params}"
-        request = urllib.request.Request(request_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GDUT-Competition-Watcher/1.0",
-            "Referer": NATIONAL_INTERNSHIP_URL,
-        })
-        payload = fetch(request.full_url)
         try:
+            request_url = f"{endpoint}?{params}"
+            payload = fetch(request_url)
             response = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError("国家大学生就业服务平台实习接口返回了无效 JSON") from exc
-        data = response.get("data") if isinstance(response, dict) else None
-        rows = data.get("list") if isinstance(data, dict) else None
-        if not isinstance(response, dict) or response.get("flag") is not True or not isinstance(rows, list):
-            raise ValueError("国家大学生就业服务平台实习接口格式异常")
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            job_id = str(row.get("jobId", "")).strip()
-            title = " ".join(html_lib.unescape(str(row.get("jobName", ""))).split())
-            if not job_id or not title:
-                continue
-            job_url = f"https://job.ncss.cn/student/jobs/{urllib.parse.quote(job_id, safe='')}/detail.html"
-            company = " ".join(html_lib.unescape(str(row.get("recName", ""))).split())
-            city = " ".join(html_lib.unescape(str(row.get("areaCodeName", ""))).split())
-            salary_low, salary_high = row.get("lowMonthPay"), row.get("highMonthPay")
-            salary = ""
-            if isinstance(salary_low, (int, float)) and isinstance(salary_high, (int, float)):
-                salary = "面议" if salary_low == salary_high == 0 else f"{salary_low:g}-{salary_high:g}K/月"
-            education = " ".join(html_lib.unescape(str(row.get("degreeName", ""))).split())
-            major = " ".join(html_lib.unescape(str(row.get("major", ""))).split())
-            published = _international_platform_date(row.get("publishDate"))
-            details = [part for part in (company, city, salary, education, f"专业：{major}" if major else "") if part]
-            if published:
-                details.append(f"发布日期：{published}")
-            notice_id = hashlib.sha256(job_url.encode("utf-8")).hexdigest()[:20]
-            notices_by_id[notice_id] = Notice(
-                id=notice_id,
-                title=title,
-                url=job_url,
-                source=NATIONAL_INTERNSHIP_SOURCE,
-                date=published,
-                summary="；".join(details),
-                category="实习",
-            )
+            if not isinstance(response, dict):
+                raise ValueError("接口格式异常：响应不是对象")
+            data = response.get("data")
+            rows = data.get("list") if isinstance(data, dict) else None
+            if response.get("flag") is not True or not isinstance(rows, list):
+                raise ValueError("接口格式异常：岗位列表缺失")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                job_id = str(row.get("jobId", "")).strip()
+                title = " ".join(html_lib.unescape(str(row.get("jobName", ""))).split())
+                if not job_id or not title:
+                    continue
+                job_url = f"https://job.ncss.cn/student/jobs/{urllib.parse.quote(job_id, safe='')}/detail.html"
+                company = " ".join(html_lib.unescape(str(row.get("recName", ""))).split())
+                city = " ".join(html_lib.unescape(str(row.get("areaCodeName", ""))).split())
+                salary_low, salary_high = row.get("lowMonthPay"), row.get("highMonthPay")
+                salary = ""
+                if isinstance(salary_low, (int, float)) and isinstance(salary_high, (int, float)):
+                    salary = "面议" if salary_low == salary_high == 0 else f"{salary_low:g}-{salary_high:g}K/月"
+                education = " ".join(html_lib.unescape(str(row.get("degreeName", ""))).split())
+                major = " ".join(html_lib.unescape(str(row.get("major", ""))).split())
+                published = _international_platform_date(row.get("publishDate"))
+                details = [part for part in (company, city, salary, education, f"专业：{major}" if major else "") if part]
+                if published:
+                    details.append(f"发布日期：{published}")
+                notice_id = hashlib.sha256(job_url.encode("utf-8")).hexdigest()[:20]
+                notices_by_id[notice_id] = Notice(
+                    id=notice_id,
+                    title=title,
+                    url=job_url,
+                    source=NATIONAL_INTERNSHIP_SOURCE,
+                    date=published,
+                    summary="；".join(details),
+                    category="实习",
+                )
+        except Exception as exc:
+            page_errors.append(f"第 {page} 页读取失败：{exc}")
     if not notices_by_id:
-        raise ValueError("国家大学生就业服务平台未返回可解析的广东实习岗位")
+        message = "国家大学生就业服务平台未返回可解析的广东实习岗位"
+        if page_errors:
+            message += "；" + "；".join(page_errors)
+        raise ValueError(message)
+    if page_errors:
+        raise PartialSourceError(list(notices_by_id.values()), "；".join(page_errors))
     return list(notices_by_id.values())
 
 
@@ -1028,9 +1047,15 @@ def check_all() -> tuple[list[Notice], list[str]]:
         source, url, source_default = item
         try:
             if source == INTERNATIONAL_INTERNSHIP_SOURCE:
-                return source, fetch_international_internship_notices(), ""
+                try:
+                    return source, fetch_international_internship_notices(), ""
+                except PartialSourceError as exc:
+                    return source, exc.notices, str(exc)
             if source == NATIONAL_INTERNSHIP_SOURCE:
-                return source, fetch_national_internship_notices(), ""
+                try:
+                    return source, fetch_national_internship_notices(), ""
+                except PartialSourceError as exc:
+                    return source, exc.notices, str(exc)
             html = fetch(url)
             if source == "学生就业指导中心赛事":
                 items = extract_career_competition_notices(html, url)
