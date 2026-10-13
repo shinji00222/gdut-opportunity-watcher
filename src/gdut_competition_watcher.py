@@ -1315,7 +1315,11 @@ def check_all() -> tuple[list[Notice], list[str]]:
             if error:
                 errors.append(f"{source}: {error}")
                 log(f"ERROR {source}: {error}")
-    return list(notices.values()), errors
+    active_notices = [
+        notice for notice in notices.values()
+        if not notice_is_stale_internship(asdict(notice))
+    ]
+    return active_notices, errors
 
 
 def notify_windows(title: str, message: str) -> None:
