@@ -47,6 +47,7 @@ SOURCES = [
     ("学生工作处", "https://xsc.gdut.edu.cn/xwzx/tzgg.htm", None),
     ("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛"),
     ("创新创业学院", "https://cxcy.gdut.edu.cn/", "竞赛"),
+    ("集成电路学院竞赛通知", "https://sme.gdut.edu.cn/index/tzgg.htm", "竞赛"),
     (GDUT_COLLECTION_SOURCE, GDUT_COLLECTION_URL, "竞赛"),
     ("广东省工科大学生实验综合技能竞赛", "https://jnds.gdut.edu.cn/", "竞赛"),
     ("工程训练中心学科竞赛", "https://etc.gdut.edu.cn/index/xkjs.htm", "竞赛"),
@@ -69,7 +70,8 @@ CATEGORY_KEYWORDS = {
     ),
     "出国": (
         "交换生", "交流项目", "海外交流", "境外交流", "出国交流", "联合培养",
-        "访学", "留学项目", "暑期学校", "冬季学校", "国际项目", "海外项目",
+        "访学", "留学项目", "国际暑期学校", "海外暑期学校", "国际冬季学校",
+        "海外冬季学校", "国际项目", "海外项目",
         "交流生", "研修项目", "名校探访", "国际寒假项目", "海外寒假项目",
         "国际暑期项目", "海外暑期项目", "短期海外游学",
     ),
@@ -944,6 +946,8 @@ def classify(title: str, source_default: str | None) -> str | None:
     normalized_title = title.casefold()
     if re.search(r"\bintern(?:ship)?\b", normalized_title):
         return "实习"
+    if "联合培养基地" in normalized_title:
+        return None
     for category in ("实习", "出国", "竞赛"):
         if any(k.casefold() in normalized_title for k in CATEGORY_KEYWORDS[category]):
             return category
