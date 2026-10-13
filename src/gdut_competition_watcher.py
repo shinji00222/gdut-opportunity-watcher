@@ -27,14 +27,22 @@ SOURCES = [
     ("学校通知公告", "https://www.gdut.edu.cn/index/tzgg.htm", None),
     ("教务处", "https://jwc.gdut.edu.cn/", "竞赛"),
     ("学生工作处", "https://xsc.gdut.edu.cn/xwzx/tzgg.htm", None),
+    ("学生就业指导中心赛事", "https://career.gdut.edu.cn/competition/competitions", "竞赛"),
+    ("创新创业学院", "https://cxcy.gdut.edu.cn/", "竞赛"),
+    ("广东省工科大学生实验综合技能竞赛", "https://jnds.gdut.edu.cn/", "竞赛"),
+    ("蓝桥杯大赛官网", "https://dasai.lanqiao.cn/pages/v7/dasai/competition/individual_competition.html", "竞赛"),
     ("国际合作与交流处", "https://wsc.gdut.edu.cn/", "出国"),
     ("就业信息网", "https://career.gdut.edu.cn/campus/index", "实习"),
 ]
 
 CATEGORY_KEYWORDS = {
     "竞赛": (
-    "竞赛", "大赛", "比赛", "挑战杯", "创新创业", "数学建模", "电子设计",
-    "程序设计", "建模竞赛", "学科竞赛", "校赛", "选拔赛", "作品征集",
+    "竞赛", "大赛", "比赛", "挑战杯", "大挑", "小挑", "创业计划竞赛",
+    "课外学术科技作品", "蓝桥杯", "创新创业", "中国国际大学生创新大赛", "互联网+",
+    "数学建模", "大学生数学竞赛", "电子设计", "大学生工程训练", "服务外包创新创业",
+    "网络安全创新大赛", "计算机设计大赛", "实验综合技能竞赛", "外研社·国才杯",
+    "词达人杯", "程序设计", "建模竞赛", "学科竞赛", "校赛", "选拔赛", "作品征集",
+    "ACM-ICPC", "ICPC", "CCPC", "RoboMaster", "RoboCup", "RAICOM", "MathorCup", "CTF",
     ),
     "出国": (
         "交换生", "交流项目", "海外交流", "境外交流", "出国交流", "联合培养",
@@ -119,6 +127,69 @@ class ParagraphParser(HTMLParser):
             self.parts = []
         if tag in ("script", "style", "nav", "footer") and self.skip:
             self.skip -= 1
+
+
+class VisibleTextParser(HTMLParser):
+    """Collect readable page text for official pages with non-paragraph layouts."""
+    def __init__(self):
+        super().__init__()
+        self.skip = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in ("script", "style", "noscript"):
+            self.skip += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in ("script", "style", "noscript") and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip:
+            clean = re.sub(r"\s+", " ", data).strip()
+            if clean:
+                self.parts.append(clean)
+
+
+def extract_lanqiao_registration_notice(html: str) -> Notice | None:
+    """Turn the Lanqiao official registration window into a season-specific notice."""
+    parser = VisibleTextParser()
+    parser.feed(html)
+    text = " ".join(parser.parts)
+    match = re.search(
+        r"报名时间\s*[：:]\s*(20\d{2})年(\d{1,2})月(\d{1,2})日\s*"
+        r"(\d{1,2}:\d{2})\s*[—–-]\s*(20\d{2})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}:\d{2})",
+        text,
+    )
+    if not match:
+        return None
+    start_year, start_month, start_day, start_time, end_year, end_month, end_day, end_time = match.groups()
+    start_date = f"{start_year}-{int(start_month):02d}-{int(start_day):02d}"
+    end_date = f"{end_year}-{int(end_month):02d}-{int(end_day):02d}"
+    period = (f"{start_year}年{int(start_month)}月{int(start_day)}日 {start_time} 至 "
+              f"{end_year}年{int(end_month)}月{int(end_day)}日 {end_time}")
+    source_url = next(url for name, url, _ in SOURCES if name == "蓝桥杯大赛官网")
+    today = date.today().isoformat()
+    if today < start_date:
+        title = f"{start_year}年蓝桥杯报名将于{int(start_month)}月{int(start_day)}日开始"
+    elif today <= end_date:
+        title = f"{start_year}年蓝桥杯报名已开放（截止{int(end_month)}月{int(end_day)}日）"
+    else:
+        title = f"{start_year}年蓝桥杯报名已截止"
+    notice_id = hashlib.sha256(f"{source_url}|{start_date}".encode("utf-8")).hexdigest()[:20]
+    return Notice(
+        id=notice_id,
+        title=title,
+        url=source_url,
+        source="蓝桥杯大赛官网",
+        date=start_date,
+        summary=f"蓝桥杯官网报名时间：{period}。请登录官网查看赛项、组别和报名要求。",
+        category="竞赛",
+        detail_text=(f"官网公布的报名时间：{period}。报名截止日期："
+                     f"{end_year}年{int(end_month)}月{int(end_day)}日 {end_time}。"
+                     "报名、缴费及准考证等事项以蓝桥杯官网说明为准。"),
+        hard_conditions=["报名组别及参赛资格请以蓝桥杯大赛官网当届通知为准。"],
+    )
 
 def log(text: str) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -241,10 +312,11 @@ def fetch(url: str) -> str:
 
 def classify(title: str, source_default: str | None) -> str | None:
     # 国际组织实习等交叉项目优先归到“实习”。
+    normalized_title = title.casefold()
     for category in ("实习", "出国", "竞赛"):
-        if any(k in title for k in CATEGORY_KEYWORDS[category]):
+        if any(k.casefold() in normalized_title for k in CATEGORY_KEYWORDS[category]):
             return category
-    return source_default if source_default and any(k in title for k in KEYWORDS) else None
+    return source_default if source_default and any(k.casefold() in normalized_title for k in KEYWORDS) else None
 
 
 def extract_notices(source: str, base_url: str, html: str, source_default: str | None = None) -> list[Notice]:
@@ -323,7 +395,13 @@ def check_all() -> tuple[list[Notice], list[str]]:
     def load_source(item):
         source, url, source_default = item
         try:
-            return source, extract_notices(source, url, fetch(url), source_default), ""
+            html = fetch(url)
+            items = extract_notices(source, url, html, source_default)
+            if source == "蓝桥杯大赛官网":
+                registration_notice = extract_lanqiao_registration_notice(html)
+                if registration_notice:
+                    items.append(registration_notice)
+            return source, items, ""
         except Exception as exc:
             return source, [], str(exc)
 
@@ -517,31 +595,90 @@ class MainWindow:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("920x560")
-        self.root.minsize(720, 420)
+        self.root.geometry("1120x720")
+        self.root.minsize(820, 560)
+        self.root.configure(background="#f3f6fb")
         self.status = tk.StringVar()
+        self.search_text = tk.StringVar()
+        self._configure_style()
         self._build()
         self.refresh()
 
-    def _build(self):
-        top = ttk.Frame(self.root, padding=12)
-        top.pack(fill="x")
-        ttk.Label(top, text="广工竞赛提醒", font=("Microsoft YaHei UI", 18, "bold")).pack(side="left")
-        self.check_btn = ttk.Button(top, text="立即检测", command=self.start_check)
-        self.check_btn.pack(side="right")
-        ttk.Button(top, text="个人档案", command=self.open_profile).pack(side="right", padx=(0, 8))
-        ttk.Label(self.root, textvariable=self.status, padding=(12, 0, 12, 8)).pack(fill="x")
+    def _configure_style(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("App.TFrame", background="#f3f6fb")
+        style.configure("Card.TFrame", background="#ffffff")
+        style.configure("Header.TFrame", background="#173b67")
+        style.configure("HeaderTitle.TLabel", background="#173b67", foreground="#ffffff",
+                        font=("Microsoft YaHei UI", 19, "bold"))
+        style.configure("HeaderHint.TLabel", background="#173b67", foreground="#c9d8eb",
+                        font=("Microsoft YaHei UI", 9))
+        style.configure("Section.TLabel", background="#ffffff", foreground="#213547",
+                        font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Muted.TLabel", background="#f3f6fb", foreground="#63758b",
+                        font=("Microsoft YaHei UI", 9))
+        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 9, "bold"),
+                        padding=(14, 8), background="#2474c6", foreground="#ffffff")
+        style.map("Primary.TButton", background=[("active", "#1d63a9"), ("disabled", "#a8bfd8")])
+        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(10, 7))
+        style.configure("TRadiobutton", background="#ffffff", foreground="#42566d",
+                        font=("Microsoft YaHei UI", 9), padding=(5, 5))
+        style.map("TRadiobutton", foreground=[("selected", "#1769aa")])
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff",
+                        foreground="#25364a", rowheight=34, font=("Microsoft YaHei UI", 9),
+                        borderwidth=0)
+        style.configure("Treeview.Heading", background="#eaf0f7", foreground="#43566c",
+                        font=("Microsoft YaHei UI", 9, "bold"), padding=(8, 9), relief="flat")
+        style.map("Treeview", background=[("selected", "#dcecff")],
+                  foreground=[("selected", "#173b67")])
+        style.map("Treeview.Heading", background=[("active", "#dce7f3")])
+        style.configure("Vertical.TScrollbar", background="#dce5ef", troughcolor="#f3f6fb", borderwidth=0)
 
-        filter_bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        filter_bar.pack(fill="x")
-        ttk.Label(filter_bar, text="分类：").pack(side="left", padx=(0, 6))
+    def _build(self):
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=18)
+        shell.pack(fill="both", expand=True)
+
+        top = ttk.Frame(shell, style="Header.TFrame", padding=(22, 18))
+        top.pack(fill="x", pady=(0, 14))
+        title_box = ttk.Frame(top, style="Header.TFrame")
+        title_box.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_box, text="广工机会提醒", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text="竞赛 · 实习 · 出国交流｜公开信息汇总与个人条件匹配",
+                  style="HeaderHint.TLabel").pack(anchor="w", pady=(4, 0))
+        actions = ttk.Frame(top, style="Header.TFrame")
+        actions.pack(side="right")
+        ttk.Button(actions, text="个人档案", command=self.open_profile).pack(side="left", padx=(0, 8))
+        self.check_btn = ttk.Button(actions, text="立即检测", style="Primary.TButton", command=self.start_check)
+        self.check_btn.pack(side="left")
+
+        toolbar = ttk.Frame(shell, style="Card.TFrame", padding=(14, 8))
+        toolbar.pack(fill="x", pady=(0, 10))
+        ttk.Label(toolbar, text="分类", style="Section.TLabel").pack(side="left", padx=(0, 8))
         self.category_filter = tk.StringVar(value="全部")
         for category in ("全部", "竞赛", "实习", "出国"):
-            ttk.Radiobutton(filter_bar, text=category, value=category,
-                            variable=self.category_filter, command=self.refresh).pack(side="left", padx=(0, 12))
+            ttk.Radiobutton(toolbar, text=category, value=category,
+                            variable=self.category_filter, command=self.refresh).pack(side="left", padx=(0, 5))
+        ttk.Label(toolbar, text="搜索", style="Section.TLabel").pack(side="left", padx=(18, 8))
+        search = ttk.Entry(toolbar, textvariable=self.search_text, width=28)
+        search.pack(side="left", ipady=4)
+        self.search_text.trace_add("write", lambda *_args: self.refresh())
+        ttk.Button(toolbar, text="清除", command=lambda: self.search_text.set("")).pack(side="left", padx=(6, 0))
 
         cols = ("favorite", "match", "category", "title", "source", "date", "seen")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", selectmode="browse")
+        list_card = ttk.Frame(shell, style="Card.TFrame", padding=(10, 10, 4, 8))
+        list_card.pack(fill="both", expand=True, pady=(0, 10))
+        list_head = ttk.Frame(list_card, style="Card.TFrame")
+        list_head.pack(fill="x", padx=(4, 8), pady=(0, 8))
+        ttk.Label(list_head, text="机会列表", style="Section.TLabel").pack(side="left")
+        self.count_label = ttk.Label(list_head, text="", style="Muted.TLabel")
+        self.count_label.pack(side="right")
+        table_frame = ttk.Frame(list_card, style="Card.TFrame")
+        table_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("favorite", text="收藏")
         self.tree.heading("match", text="匹配度")
         self.tree.heading("category", text="分类")
@@ -549,24 +686,30 @@ class MainWindow:
         self.tree.heading("source", text="来源链接")
         self.tree.heading("date", text="发布日期")
         self.tree.heading("seen", text="首次发现")
-        self.tree.column("favorite", width=55, anchor="center", stretch=False)
-        self.tree.column("match", width=65, anchor="center", stretch=False)
-        self.tree.column("category", width=70, anchor="center")
-        self.tree.column("title", width=290)
-        self.tree.column("source", width=120, anchor="center")
-        self.tree.column("date", width=90, anchor="center")
-        self.tree.column("seen", width=150, anchor="center")
-        self.tree.pack(fill="both", expand=True, padx=12)
+        self.tree.column("favorite", width=58, minwidth=48, anchor="center", stretch=False)
+        self.tree.column("match", width=76, minwidth=65, anchor="center", stretch=False)
+        self.tree.column("category", width=80, minwidth=70, anchor="center", stretch=False)
+        self.tree.column("title", width=390, minwidth=220, stretch=True)
+        self.tree.column("source", width=150, minwidth=110, anchor="center", stretch=False)
+        self.tree.column("date", width=100, minwidth=85, anchor="center", stretch=False)
+        self.tree.column("seen", width=165, minwidth=130, anchor="center", stretch=False)
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=y_scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        y_scroll.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self.open_selected)
         self.tree.bind("<ButtonRelease-1>", self.handle_click)
         self.tree.bind("<Button-3>", self.show_conditions_popup)
         self.tree.bind("<<TreeviewSelect>>", self.show_summary)
-        self.tree.tag_configure("favorite", background="#fff2a8")
-        self.tree.tag_configure("hard_fail", foreground="#c62828")
+        self.tree.tag_configure("favorite", background="#fff6d8")
+        self.tree.tag_configure("hard_fail", foreground="#b33a3a")
 
-        summary_box = ttk.LabelFrame(self.root, text="简略介绍与条件分析", padding=10)
-        summary_box.pack(fill="x", padx=12, pady=(8, 0))
-        self.summary = tk.Text(summary_box, height=6, wrap="word", relief="flat", background="#f4f4f4")
+        summary_box = ttk.Frame(shell, style="Card.TFrame", padding=14)
+        summary_box.pack(fill="x", pady=(0, 10))
+        ttk.Label(summary_box, text="详情与匹配分析", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.summary = tk.Text(summary_box, height=5, wrap="word", relief="flat", padx=10, pady=8,
+                               background="#f7f9fc", foreground="#34465b",
+                               font=("Microsoft YaHei UI", 9), highlightthickness=0)
         self.summary.pack(fill="x")
         self.summary.insert("1.0", "选择一条竞赛消息，这里会显示简略介绍。")
         self.summary.tag_configure("link", foreground="#0563c1", underline=True)
@@ -576,9 +719,10 @@ class MainWindow:
         self.summary.config(state="disabled")
         self.summary_link_url = ""
 
-        bottom = ttk.Frame(self.root, padding=12)
+        bottom = ttk.Frame(shell, style="App.TFrame")
         bottom.pack(fill="x")
-        ttk.Label(bottom, text="双击消息打开学校原通知。计划任务每天运行两次，完成后自动退出。").pack(side="left")
+        ttk.Label(bottom, textvariable=self.status, style="Muted.TLabel").pack(side="left", fill="x", expand=True)
+        ttk.Label(bottom, text="双击打开原通知 · 右键查看条件", style="Muted.TLabel").pack(side="left", padx=12)
         ttk.Button(bottom, text="打开日志", command=lambda: os.startfile(LOG_FILE) if LOG_FILE.exists() else None).pack(side="right")
 
     def refresh(self):
@@ -589,6 +733,9 @@ class MainWindow:
         profile = state.get("profile", {})
         selected_category = self.category_filter.get() if hasattr(self, "category_filter") else "全部"
         visible = notices if selected_category == "全部" else [n for n in notices if n.get("category", "竞赛") == selected_category]
+        query = self.search_text.get().strip().casefold()
+        if query:
+            visible = [n for n in visible if query in " ".join((n.get("title", ""), n.get("summary", ""), n.get("source", ""))).casefold()]
         ranked = []
         for n in visible:
             score, conditions, hard_fail = evaluate_notice(n, profile)
@@ -600,7 +747,8 @@ class MainWindow:
             self.tree.insert("", "end", iid=n["id"], tags=tags,
                              values=(("●" if is_favorite else "○"), f"{-neg_score}%", n.get("category", "竞赛"), n["title"],
                                      f"{n['source']} ↗", n.get("date", ""), n.get("first_seen", "")))
-        detail = f"上次检测：{state.get('last_check', '从未')}　当前显示：{len(visible)} 条　全部：{len(notices)} 条"
+        self.count_label.config(text=f"显示 {len(visible)} / 共 {len(notices)} 条")
+        detail = f"上次检测：{state.get('last_check', '从未')}"
         if state.get("last_error"):
             detail += "　部分来源暂时无法访问"
         self.status.set(detail)
@@ -755,8 +903,18 @@ class MainWindow:
         threading.Thread(target=self._check_worker, daemon=True).start()
 
     def _check_worker(self):
-        new_items, errors, first = run_check(notify=True)
+        try:
+            new_items, errors, first = run_check(notify=True)
+        except Exception as exc:
+            log(f"检测任务异常: {exc!r}")
+            self.root.after(0, lambda: self._check_failed())
+            return
         self.root.after(0, lambda: self._check_done(new_items, errors, first))
+
+    def _check_failed(self):
+        self.check_btn.config(state="normal")
+        self.status.set("检测意外中断，详情已写入日志。")
+        messagebox.showerror(APP_NAME, "检测过程中发生异常。请打开日志查看详情，然后重试。")
 
     def _check_done(self, new_items, errors, first):
         self.check_btn.config(state="normal")
