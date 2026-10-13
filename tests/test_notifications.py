@@ -59,6 +59,33 @@ class LanqiaoRegistrationNotificationTests(unittest.TestCase):
                 notify.assert_called_once()
 
 
+class CheckCoordinationTests(unittest.TestCase):
+    def test_check_mutex_allows_one_run_and_skips_overlap(self):
+        with watcher._check_mutex() as first:
+            self.assertTrue(first)
+            with watcher._check_mutex() as second:
+                self.assertFalse(second)
+
+    def test_run_check_does_not_start_a_second_worker_when_locked(self):
+        with watcher._check_mutex():
+            with patch.object(watcher, "log"):
+                new_items, errors, first_run = watcher.run_check()
+        self.assertEqual(new_items, [])
+        self.assertEqual(errors, [watcher.CHECK_ALREADY_RUNNING])
+        self.assertFalse(first_run)
+
+    def test_scheduled_check_reports_source_errors_but_ignores_overlap(self):
+        with patch.object(watcher, "run_check", return_value=([], ["source offline"], False)):
+            self.assertEqual(watcher.run_scheduled_check(), 1)
+        with patch.object(
+            watcher, "run_check", return_value=([], [watcher.CHECK_ALREADY_RUNNING], False)
+        ):
+            self.assertEqual(watcher.run_scheduled_check(), 0)
+        with patch.object(watcher, "run_check", side_effect=OSError("state unavailable")):
+            with patch.object(watcher, "log"):
+                self.assertEqual(watcher.run_scheduled_check(), 1)
+
+
 class StateFileSafetyTests(unittest.TestCase):
     def test_corrupt_state_is_preserved_and_save_replaces_atomically(self):
         with tempfile.TemporaryDirectory() as temp_dir:

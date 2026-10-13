@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import threading
 import urllib.parse
 import urllib.request
 import webbrowser
+import ctypes
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from html.parser import HTMLParser
@@ -25,6 +27,8 @@ STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "watcher.log"
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 1024 * 1024
+CHECK_ALREADY_RUNNING = "已有一次检测正在运行，本次跳过"
+_THREAD_CHECK_LOCK = threading.Lock()
 
 SOURCES = [
     ("学校通知公告", "https://www.gdut.edu.cn/index/tzgg.htm", None),
@@ -671,7 +675,50 @@ def notify_windows(title: str, message: str) -> None:
         log(f"通知发送失败: {exc!r}")
 
 
+@contextmanager
+def _check_mutex():
+    """Prevent a scheduled run and a manual run from overwriting each other's state."""
+    if os.name != "nt":
+        acquired = _THREAD_CHECK_LOCK.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _THREAD_CHECK_LOCK.release()
+        return
+
+    mutex_hash = hashlib.sha256(str(APP_DIR).casefold().encode("utf-8")).hexdigest()[:16]
+    mutex_name = f"Local\\GDUTCompetitionWatcher.Check.{mutex_hash}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, True, mutex_name)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "无法创建检测互斥锁")
+    already_exists = ctypes.get_last_error() == 183
+    if already_exists:
+        kernel32.CloseHandle(handle)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
+
 def run_check(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
+    with _check_mutex() as acquired:
+        if not acquired:
+            log(CHECK_ALREADY_RUNNING)
+            return [], [CHECK_ALREADY_RUNNING], False
+        return _run_check_locked(notify)
+
+
+def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], bool]:
     state = load_state()
     current, errors = check_all()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1182,6 +1229,10 @@ class MainWindow:
     def _check_done(self, new_items, errors, first):
         self.check_btn.config(state="normal")
         self.refresh()
+        if errors == [CHECK_ALREADY_RUNNING]:
+            self.status.set("另一项检测正在运行，本次已跳过。")
+            messagebox.showinfo(APP_NAME, "另一项检测正在运行，本次已跳过。")
+            return
         if first:
             messagebox.showinfo(APP_NAME, "首次检测完成，已建立消息基线。以后只提醒新增竞赛消息。")
         elif new_items:
@@ -1195,15 +1246,27 @@ class MainWindow:
         self.root.mainloop()
 
 
+def run_scheduled_check() -> int:
+    try:
+        _new_items, errors, _first_run = run_check(notify=True)
+    except Exception as exc:
+        log(f"计划检测异常: {exc!r}")
+        return 1
+    if errors == [CHECK_ALREADY_RUNNING]:
+        return 0
+    return 1 if errors else 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scheduled", action="store_true", help="执行一次静默检查并退出")
     args = parser.parse_args()
     if args.scheduled:
-        run_check(notify=True)
+        return run_scheduled_check()
     else:
         MainWindow().run()
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

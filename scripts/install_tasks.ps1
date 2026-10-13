@@ -19,7 +19,7 @@ New-Item -ItemType Directory -Path $appDir -Force | Out-Null
 Copy-Item -LiteralPath $exeSource -Destination $exeTarget -Force
 
 $action = New-ScheduledTaskAction -Execute $exeTarget -Argument "--scheduled"
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 foreach ($item in @(@("上午", $FirstTime), @("晚上", $SecondTime))) {
