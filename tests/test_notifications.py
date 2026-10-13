@@ -299,6 +299,24 @@ class SourceHealthTests(unittest.TestCase):
         self.assertEqual(len(notices), 2)
         self.assertTrue(all(notice.category == "竞赛" for notice in notices))
 
+    def test_international_winter_program_is_classified_as_study_abroad(self):
+        source = next(item for item in watcher.SOURCES if item[0] == "国际合作与交流处")
+        html = '<a href="/info/1115/4359.htm">2027韩国檀国大学国际寒假项目（资助项目）</a>'
+
+        with (
+            patch.object(watcher, "SOURCES", [source]),
+            patch.object(watcher, "fetch", return_value=html),
+        ):
+            notices, errors = watcher.check_all()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].category, "出国")
+        self.assertEqual(
+            notices[0].url,
+            "https://wsc.gdut.edu.cn/info/1115/4359.htm",
+        )
+
     def test_verification_page_is_reported_as_a_fetch_failure(self):
         response = BytesIO("<html>请完成人机验证后继续</html>".encode("utf-8"))
         response.headers = Message()
