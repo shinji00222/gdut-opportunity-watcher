@@ -66,7 +66,10 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
 
 升级前先关闭程序，再运行 Windows 发布包中的安装脚本。卸载脚本会移除程序文件、计划任务和快捷方式，但保留 `%LOCALAPPDATA%\GDUTCompetitionWatcher` 中的个人档案、历史和日志。
 
+## 项目文档
+
+- [项目逻辑关系说明](docs/项目逻辑关系.md)：介绍采集、分类、去重、条件提取、个性化匹配、通知与 Windows 定时运行之间的关系。
+
 ## 开源许可
 
 MIT License
-
