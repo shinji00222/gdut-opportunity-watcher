@@ -194,14 +194,16 @@ class CheckCoordinationTests(unittest.TestCase):
             state_file = app_dir / "state.json"
             notice_id = "stable-url-id"
             checked_at = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+            old_deadline = date.today() + timedelta(days=3)
+            new_deadline = date.today() + timedelta(days=10)
             old_notice = watcher.Notice(
                 id=notice_id,
                 title="校内创新竞赛报名通知",
                 url="https://example.com/event",
                 source="测试来源",
                 category="竞赛",
-                summary="报名截止时间为2026年10月12日。",
-                detail_text="报名截止时间为2026年10月12日，请按通知要求提交参赛材料。",
+                summary=f"报名截止时间为{old_deadline:%Y年%m月%d日}。",
+                detail_text=f"报名截止时间为{old_deadline:%Y年%m月%d日}，请按通知要求提交参赛材料。",
                 hard_conditions=["本科生可报名"],
                 detail_checked_at=checked_at,
             )
@@ -221,7 +223,7 @@ class CheckCoordinationTests(unittest.TestCase):
                 category=old_notice.category,
             )
             revised_html = (
-                "<html><body><p>报名截止时间调整为2026年10月20日，"
+                f"<html><body><p>报名截止时间调整为{new_deadline:%Y年%m月%d日}，"
                 "请参赛队按新时间提交报名表和相关材料。</p></body></html>"
             )
 
@@ -239,7 +241,7 @@ class CheckCoordinationTests(unittest.TestCase):
                 self.assertEqual([item.id for item in new_items], [notice_id])
                 self.assertEqual(notify.call_count, 1)
                 saved_notice = watcher.load_state()["notices"][0]
-                self.assertIn("10月20日", saved_notice["detail_text"])
+                self.assertIn(f"{new_deadline:%m月%d日}", saved_notice["detail_text"])
 
                 new_items, _, _ = watcher.run_check()
                 self.assertEqual(new_items, [])
@@ -637,6 +639,38 @@ class StateFileSafetyTests(unittest.TestCase):
             self.assertIn("new entry", log_file.read_text(encoding="utf-8"))
 
 
+class ProxyFallbackTests(unittest.TestCase):
+    def setUp(self):
+        watcher._proxy_unusable.clear()
+        self.addCleanup(watcher._proxy_unusable.clear)
+
+    def test_refused_system_proxy_falls_back_to_direct_and_stays_direct(self):
+        request = watcher.urllib.request.Request("https://example.com/")
+        refused = watcher.urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
+        with (
+            patch.object(watcher.urllib.request, "getproxies", return_value={"https": "http://127.0.0.1:10808"}),
+            patch.object(watcher.urllib.request, "urlopen", side_effect=refused) as via_proxy,
+            patch.object(watcher._DIRECT_OPENER, "open", return_value="direct") as direct,
+            patch.object(watcher, "log"),
+        ):
+            self.assertEqual(watcher.open_url(request), "direct")
+            self.assertEqual(watcher.open_url(request), "direct")
+        self.assertEqual(via_proxy.call_count, 1)
+        self.assertEqual(direct.call_count, 2)
+
+    def test_http_error_through_working_proxy_is_not_retried(self):
+        request = watcher.urllib.request.Request("https://example.com/")
+        not_found = watcher.urllib.error.HTTPError(request.full_url, 404, "Not Found", Message(), None)
+        with (
+            patch.object(watcher.urllib.request, "getproxies", return_value={"https": "http://127.0.0.1:10808"}),
+            patch.object(watcher.urllib.request, "urlopen", side_effect=not_found),
+            patch.object(watcher._DIRECT_OPENER, "open") as direct,
+        ):
+            with self.assertRaises(watcher.urllib.error.HTTPError):
+                watcher.open_url(request)
+        direct.assert_not_called()
+
+
 class SourceHealthTests(unittest.TestCase):
     @staticmethod
     def _career_page(title, event_id, pagination=""):
@@ -721,21 +755,21 @@ class SourceHealthTests(unittest.TestCase):
     def test_archived_and_non_event_links_are_filtered(self):
         html = """
         <a href="/old">2019年广东省工科大学生实验综合技能竞赛</a>
-        <a href="/current">2025年大学生数学竞赛报名通知</a>
+        <a href="/current">2026年大学生数学竞赛报名通知</a>
         <a href="/nav">创新创业教育</a>
         <a href="/logistics">竞赛场地、就餐地点及住宿信息</a>
         """
         notices = watcher.extract_notices(
             "测试竞赛", "https://example.com", html, "竞赛", today=date(2026, 10, 13)
         )
-        self.assertEqual([notice.title for notice in notices], ["2025年大学生数学竞赛报名通知"])
+        self.assertEqual([notice.title for notice in notices], ["2026年大学生数学竞赛报名通知"])
 
     def test_pruning_archives_removes_stale_items_and_favorites(self):
         state = {
             "notices": [
                 {"id": "old", "title": "2019年大学生竞赛", "category": "竞赛"},
                 {"id": "noise", "title": "创新创业教育", "category": "竞赛"},
-                {"id": "current", "title": "2025年大学生竞赛", "category": "竞赛"},
+                {"id": "current", "title": "2026年大学生竞赛", "category": "竞赛"},
             ],
             "favorites": ["old", "noise", "current"],
         }

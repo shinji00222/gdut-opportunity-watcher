@@ -10,6 +10,7 @@ import os
 import re
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -955,11 +956,37 @@ def prune_expired_notices(state: dict, today: date | None = None) -> list[str]:
     return sorted(item for item in removed_ids if item)
 
 
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_proxy_unusable = threading.Event()
+
+
+def open_url(request: urllib.request.Request, timeout: int = 20):
+    """Use the system proxy when it works; fall back to a direct connection when it is off."""
+    if not urllib.request.getproxies() or _proxy_unusable.is_set():
+        return _DIRECT_OPENER.open(request, timeout=timeout)
+    # 走代理时 urllib 会把 Request 的主机改成代理地址，回退直连必须用一份新请求。
+    direct_request = urllib.request.Request(
+        request.full_url,
+        data=request.data,
+        headers=dict(request.header_items()),
+        method=request.get_method(),
+    )
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+        # 系统代理开着但代理软件没运行（WinError 10061）时，本次检查后续请求都直连。
+        _proxy_unusable.set()
+        log(f"系统代理不可用，改为直连：{exc}")
+        return _DIRECT_OPENER.open(direct_request, timeout=timeout)
+
+
 def fetch(url: str) -> str:
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GDUT-Competition-Watcher/1.0"
     })
-    with urllib.request.urlopen(req, timeout=20) as response:
+    with open_url(req) as response:
         raw = response.read(MAX_PAGE_BYTES + 1)
         if len(raw) > MAX_PAGE_BYTES:
             raise ValueError(f"网页超过 {MAX_PAGE_BYTES // (1024 * 1024)} MB，已停止读取")
@@ -1094,7 +1121,7 @@ def fetch_gdut_collection_notices(today: date | None = None) -> list[Notice]:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with open_url(request) as response:
                 raw = response.read(MAX_PAGE_BYTES + 1)
             if len(raw) > MAX_PAGE_BYTES:
                 raise ValueError(f"接口响应超过 {MAX_PAGE_BYTES // (1024 * 1024)} MB")
