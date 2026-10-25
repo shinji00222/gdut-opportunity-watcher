@@ -1473,7 +1473,8 @@ def _run_check_locked(notify: bool = True) -> tuple[list[Notice], list[str], boo
         title_changed = bool(old.get("title") and old["title"] != n.title)
         old_deadline = extract_registration_deadline(old)
         new_deadline = extract_registration_deadline(asdict(n))
-        deadline_changed = old_deadline != new_deadline and (old_deadline is not None or new_deadline is not None)
+        # 详情每轮只抓一部分，第一次读到正文时识别出截止日不算“修改”，否则会重复提醒。
+        deadline_changed = old_deadline is not None and old_deadline != new_deadline
         if title_changed or deadline_changed:
             revised_ids.add(n.id)
 
